@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 # Copyright 2026 Alexander Komarov
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# -*- coding: utf-8 -*-
 
 """
 Iyye – high‑level orchestrator.
+
 """
 
 # --------------------------------------------------------------------------- #
@@ -35,21 +36,15 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Callable, Optional
 
 from iyye_base import PROJECT_ROOT, BaseSensorQueue, BaseActuator, ProcessingStream
-
-# Matches text that describes an ephemeral system metric snapshot.
-# Facts matching this regex are never promoted to LTM.
-_EPHEMERAL_METRIC_RE = re.compile(
-    r'\b(?:cpu|memory|mem|disk|ram|adenosine)\b.{0,40}\b\d+\.?\d*\s*%'
-    r'|\b\d+\.?\d*\s*%.{0,40}\b(?:cpu|memory|mem|disk|ram)\b'
-    r'|\badenosine\s+(?:level|registers).{0,40}\b\d+\.?\d*\b'
-    r'|\b(?:cpu|memory|mem)\s+(?:usage|utilization|load|level)\b',
-    re.IGNORECASE,
+from memory_filters import (
+    EPHEMERAL_METRIC_RE as _EPHEMERAL_METRIC_RE,
+    SKIP_STREAM_NAMES as _REPLAY_SKIP_LLM,
+    SKIP_STREAM_PREFIXES as _REPLAY_SKIP_PREFIXES,
+    SKIP_STREAM_KEYWORDS as _REPLAY_SKIP_KEYWORDS,
 )
 
-# Matches LTM-unworthy content: LLM null-result placeholders, system status
-# sentences, vague cognitive/operational state descriptions, and LLM
-# chain-of-thought / reasoning artefacts that carry no durable information
-# about the user or the world.
+# LTM-specific noise filter — kept here because it is only used during
+# sleep replay, not by the STM pipeline.
 _LTM_NOISE_RE = re.compile(
     # LLM "nothing to report" placeholders (often wrapped in parens/brackets/backticks)
     r'^\s*[\(\[]?no facts?\b'
@@ -126,34 +121,6 @@ _LTM_NOISE_RE = re.compile(
     r'|\bpotentiality\s+to\s+actuality\b',
     re.IGNORECASE,
 )
-
-# Streams whose output is never sent to the LLM for fact extraction during
-# the sleep-phase replay.  Chat / telegram are skipped by keyword match.
-_REPLAY_SKIP_LLM = frozenset({
-    'attention_stream', 'alignment_stream', 'stream_factory',
-    'adenosine_stream', 'stm_update', 'llm_management',
-    'self_reflection',
-})
-
-# Prefix match: any stream whose name starts with one of these prefixes is
-# also skipped for LLM fact extraction during replay.  LLM-generated streams
-# log only internal operational noise ("curiosity fulfilled", "system active")
-# that is never a fact about the world.
-_REPLAY_SKIP_PREFIXES = (
-    'llmsuggested',     # matches LlmsuggestedAgencystream3, etc.
-    'llm_suggested',    # matches llm_suggested_hardware_stream, etc.
-    'llmexplore',       # matches LlmExploreSocialFollowUp, etc.
-    'explore_',         # matches explore_social_followup_stream, etc.
-    'suggested_',       # matches suggested_self_preservation_monitor, etc.
-    'plan_suggested',   # PlannedContinuationStream fallback streams
-    'research_',        # WebResearchStream — result already sent to user
-    'hardware_',        # matches hardware_suggestion_curiosity, etc.
-)
-
-# LLM-generated streams sometimes use custom names that don't start with
-# any skip prefix but still contain telltale keywords.  These are checked
-# as substring containment (not prefix match) as a safety net.
-_REPLAY_SKIP_KEYWORDS = ('_suggestion_', '_suggested_')
 
 # --------------------------------------------------------------------------- #
 # Logging configuration – easy to turn on/off from the command line.
@@ -804,45 +771,66 @@ class IyyeBrain:
             self._current_conscious = self.streams[0]
             self._current_conscious.is_conscious = True
 
+    # Names of streams that run in a fixed order after the conscious stream.
+    _SPECIAL_STREAM_NAMES = frozenset({
+        'attention_stream', 'alignment_stream',
+        'stream_factory', 'adenosine_stream', 'stm_update',
+    })
+    # Execution order for special streams: factory creates streams BEFORE
+    # attention_stream decides which to promote.
+    _SPECIAL_STREAM_ORDER = [
+        'alignment_stream', 'stm_update', 'stream_factory',
+        'adenosine_stream', 'attention_stream',
+    ]
+
     def _awake_actions(self, sensors_data: Dict[str, List[Any]]) -> Optional[List[Any]]:
-        """Main awake state processing."""
+        """Main awake state processing.
+
+        Phase order:
+        1. merge_deferred_sensor_data — inject data from waking/interrupt/factory
+        2. build_tick_context — assemble the dict every stream receives
+        3. run_regular_streams — subconscious (non-special, non-conscious)
+        4. ensure_conscious_stream — pick one if none assigned
+        5. run_conscious_stream — chat / active task
+        6. run_special_streams — alignment → stm → factory → adenosine → attention
+        7. apply_attention_result — promote/demote if attention said so
+        8. maybe_wind_down — periodic save + adenosine depletion check
+        """
         if not self.streams:
             log.warning("No active streams!")
             return None
 
-        # Merge sensor data collected during WAKING_UP (would otherwise be dropped).
-        waking_acc = getattr(self, '_waking_up_sensors_data', None)
-        if waking_acc:
-            for name, items in waking_acc.items():
-                if items:
-                    sensors_data.setdefault(name, [])
-                    sensors_data[name] = items + sensors_data[name]
-            self._waking_up_sensors_data = {}
+        sensors_data = self._merge_deferred_sensor_data(sensors_data)
+        context = self._build_tick_context(sensors_data)
+        subconscious_results = self._run_regular_streams(context)
+        self._ensure_conscious_stream()
+        conscious_result = self._run_conscious_stream(context)
+        subconscious_results += self._run_special_streams(context)
+        self._apply_attention_result(subconscious_results)
+        self._maybe_wind_down()
 
-        # Merge any sensor data that was captured during the interrupt wakeup tick.
-        # That data was popped from queues before the interrupt was detected and would
-        # otherwise be lost; injecting it here ensures the first conscious tick sees it.
-        pending = getattr(self, '_pending_interrupt_data', None)
-        if pending:
-            for name, items in pending.items():
-                if items:
-                    sensors_data.setdefault(name, [])
-                    sensors_data[name] = items + sensors_data[name]
-            self._pending_interrupt_data = None
+        return [conscious_result] if conscious_result is not None else subconscious_results
 
-        # Replay sensor payloads that were buffered by StreamFactory before
-        # creating a new stream.  Without this, the stream that was shaped
-        # around this data would never see it because pop_all() already
-        # consumed it ticks ago.
-        factory_replay = getattr(self, '_pending_factory_replay', None)
-        if factory_replay:
-            for name, items in factory_replay.items():
-                if items:
-                    sensors_data.setdefault(name, [])
-                    sensors_data[name] = items + sensors_data[name]
-            self._pending_factory_replay = None
+    # ---- awake phase helpers ----------------------------------------- #
 
-        context = {
+    def _merge_deferred_sensor_data(
+        self, sensors_data: Dict[str, List[Any]],
+    ) -> Dict[str, List[Any]]:
+        """Inject sensor payloads that were stashed during prior transitions."""
+        for attr in ('_waking_up_sensors_data',
+                     '_pending_interrupt_data',
+                     '_pending_factory_replay'):
+            stashed = getattr(self, attr, None)
+            if stashed:
+                for name, items in stashed.items():
+                    if items:
+                        sensors_data.setdefault(name, [])
+                        sensors_data[name] = items + sensors_data[name]
+                setattr(self, attr, {} if attr == '_waking_up_sensors_data' else None)
+        return sensors_data
+
+    def _build_tick_context(self, sensors_data: Dict[str, List[Any]]) -> dict:
+        return {
             'sensors_data': sensors_data,
             'streams': self.streams,
             'memory': self.memory,
@@ -851,133 +839,123 @@ class IyyeBrain:
             'adenosine': self.adenosine.level,
             'tick_counter': getattr(self, '_tick_counter', 0),
             'actuators': self.actuators,
-            # Self-reflection snapshot from the previous tick — always one tick
-            # stale but practically "current".  UserChatStream uses this to build
-            # a rich system_state string for the LLM prompt.
             'self_reflection_state': getattr(self, '_self_reflection_snapshot', None),
         }
 
-        # Run subconscious streams.
-        # HLD: all streams execute every tick; "conscious" is a focus/priority
-        # designation, not an exclusive execution gate.  The attention stream
-        # decides which one is the focused (conscious) stream, but the others
-        # still run as background processes.
+    def _run_regular_streams(self, context: dict) -> List[Any]:
+        """Execute non-special, non-conscious subconscious streams."""
         current_conscious = getattr(self, '_current_conscious', None)
-        subconscious_results = []
-        _special_names = {'attention_stream', 'alignment_stream',
-                          'stream_factory', 'adenosine_stream', 'stm_update'}
+        results: List[Any] = []
         for stream in self.streams:
             if stream is current_conscious:
                 continue
-            # Skip special streams that run separately in their own loop below
-            if stream.name in _special_names:
+            if stream.name in self._SPECIAL_STREAM_NAMES:
                 continue
             try:
                 result = stream.execute(context)
                 if result:
-                    subconscious_results.append(result)
-                # Record subconscious stream activity for sleep replay so
-                # insights from non-conscious streams are not lost.
-                # Housekeeping streams in _REPLAY_SKIP_LLM are excluded
-                # at replay time, so logging them here is harmless but
-                # we skip them anyway to keep the log focused.
+                    results.append(result)
                 if stream.name not in _REPLAY_SKIP_LLM:
                     self.add_to_stream_log(stream, result)
             except StopIteration:
                 log.info("Stream %s stopped at checkpoint", stream.name)
             except Exception as exc:
                 log.error("Subconscious stream %s error: %s", stream.name, exc)
+        return results
 
-        # Select conscious stream if none assigned (must happen before executing it)
-        if current_conscious is None and self.streams:
-            candidates = [s for s in self.streams
-                         if getattr(s, '_can_be_conscious', True)]
-            if candidates:
-                candidates.sort(key=lambda s: -getattr(s, 'priority', 1))
-                current_conscious = candidates[0]
-                self._current_conscious = current_conscious
-                self._was_conscious_streams.add(current_conscious.name)
-                log.info("Selected %s as conscious stream", current_conscious.name)
+    def _ensure_conscious_stream(self) -> None:
+        """Select a conscious stream if none is currently assigned."""
+        if getattr(self, '_current_conscious', None) is not None:
+            return
+        if not self.streams:
+            return
+        candidates = [s for s in self.streams
+                      if getattr(s, '_can_be_conscious', True)]
+        if candidates:
+            candidates.sort(key=lambda s: -getattr(s, 'priority', 1))
+            self._current_conscious = candidates[0]
+            self._was_conscious_streams.add(self._current_conscious.name)
+            log.info("Selected %s as conscious stream", self._current_conscious.name)
 
-        # Run conscious stream BEFORE special streams so that chat/task responses
-        # are sent immediately without being blocked by the alignment LLM call.
-        result = None
-        if current_conscious:
-            current_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
-            try:
-                result = current_conscious.execute(context)
-                self.add_to_stream_log(current_conscious, result)
-                # The stream may have retired itself (removed from self.streams)
-                # during execute().  Clear the conscious pointer so the next tick
-                # picks a fresh candidate instead of holding a dead reference.
-                if current_conscious not in self.streams:
-                    log.info("Conscious stream %s retired itself", current_conscious.name)
-                    current_conscious.is_conscious = False
-                    self._current_conscious = None
-            except StopIteration:
-                log.info("Conscious stream %s stopped at checkpoint",
-                    current_conscious.name)
+    def _run_conscious_stream(self, context: dict) -> Any:
+        """Execute the conscious stream. Returns its result or None."""
+        current_conscious = self._current_conscious
+        if current_conscious is None:
+            return None
+        current_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
+        try:
+            result = current_conscious.execute(context)
+            self.add_to_stream_log(current_conscious, result)
+            # The stream may have retired itself (removed from self.streams)
+            # during execute().  Clear the pointer so the next tick picks fresh.
+            if current_conscious not in self.streams:
+                log.info("Conscious stream %s retired itself", current_conscious.name)
+                current_conscious.is_conscious = False
                 self._current_conscious = None
-            except Exception as exc:
-                log.error("Conscious stream %s error: %s", current_conscious.name, exc)
+            return result
+        except StopIteration:
+            log.info("Conscious stream %s stopped at checkpoint",
+                     current_conscious.name)
+            self._current_conscious = None
+        except Exception as exc:
+            log.error("Conscious stream %s error: %s", current_conscious.name, exc)
+        return None
 
-        # Run special subconscious streams in a fixed order so that factory
-        # creates streams BEFORE attention_stream decides which to promote.
-        # alignment → stm_update → factory → adenosine → attention
-        _special_order = ['alignment_stream', 'stm_update', 'stream_factory',
-                          'adenosine_stream', 'attention_stream']
-        _special_map = {s.name: s for s in self.streams if s.name in _special_order}
-        for sp_name in _special_order:
-            stream = _special_map.get(sp_name)
+    def _run_special_streams(self, context: dict) -> List[Any]:
+        """Run special subconscious streams in fixed order."""
+        by_name = {s.name: s for s in self.streams
+                   if s.name in self._SPECIAL_STREAM_NAMES}
+        results: List[Any] = []
+        for sp_name in self._SPECIAL_STREAM_ORDER:
+            stream = by_name.get(sp_name)
             if stream is None:
                 continue
             try:
-                result_sp = stream.execute(context)
-                if result_sp:
-                    subconscious_results.append(result_sp)
+                result = stream.execute(context)
+                if result:
+                    results.append(result)
             except Exception as exc:
                 log.error("Special stream %s error: %s", sp_name, exc)
+        return results
 
-        # Check attention stream result for stream swap (from subconscious_results)
+    def _apply_attention_result(self, subconscious_results: List[Any]) -> None:
+        """Promote/demote streams if the attention stream requested a swap."""
         attention_result = None
         for r in subconscious_results:
             if isinstance(r, dict) and 'promote' in r:
                 attention_result = r
                 break
-        
-        if attention_result and attention_result.get('promote'):
-            old_conscious = self._current_conscious
-            if old_conscious:
-                old_conscious.is_conscious = False  # Properly demote
-                old_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
-            self._current_conscious = attention_result['promote']
-            self._current_conscious.is_conscious = True
-            self._current_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
-            self._was_conscious_streams.add(self._current_conscious.name)
-            log.info("Attention: promoting %s (demoting %s)",
-                    self._current_conscious.name,
-                    old_conscious.name if old_conscious else "none")
-            # HLD: adenosine depletes on changing consciousness focus.
-            if hasattr(self, 'adenosine'):
-                self.adenosine.drain_activity("consciousness_switch")
 
-        # Periodic state save — covers crash during awake ticks so the goal
-        # coverage registry is not lost.  Every 100 ticks ≈ ~2 minutes.
+        if not (attention_result and attention_result.get('promote')):
+            return
+
+        old_conscious = self._current_conscious
+        if old_conscious:
+            old_conscious.is_conscious = False
+            old_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
+        self._current_conscious = attention_result['promote']
+        self._current_conscious.is_conscious = True
+        self._current_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
+        self._was_conscious_streams.add(self._current_conscious.name)
+        log.info("Attention: promoting %s (demoting %s)",
+                 self._current_conscious.name,
+                 old_conscious.name if old_conscious else "none")
+        if hasattr(self, 'adenosine'):
+            self.adenosine.drain_activity("consciousness_switch")
+
+    def _maybe_wind_down(self) -> None:
+        """Periodic state save and adenosine depletion check."""
         _awake_ticks = getattr(self, '_awake_tick_count', 0) + 1
         self._awake_tick_count = _awake_ticks
         if _awake_ticks % 100 == 0:
             self._save_iyye_state()
 
-        # Check for wind-down trigger from adenosine.
-        # Enforce a minimum of 10 ticks awake so a freshly woken brain always has
-        # time to finish the current reply exchange before sleeping again.
         _MIN_AWAKE_TICKS = 10
         if self.adenosine.is_depleted() and _awake_ticks >= _MIN_AWAKE_TICKS:
-            log.info("Adenosine depleted - initiating wind-down (awake %d ticks)", _awake_ticks)
+            log.info("Adenosine depleted - initiating wind-down (awake %d ticks)",
+                     _awake_ticks)
             self.state = MindState.WINDING_DOWN
             self.winding_down_started = False
-
-        return [result] if result is not None else subconscious_results
 
     def _check_system_state(self) -> Dict[str, Any]:
         """
@@ -1404,17 +1382,6 @@ class IyyeBrain:
 
         # Don't check git sensor for code changes, only self can write to git
 
-        return False
-
-    def _is_high_priority(self, sensor_name: str, data: List[Any]) -> bool:
-        """Determine if sensor data warrants immediate wakeup."""
-        # Stub - implement based on sensor type and content analysis
-        if "hardware" in sensor_name:
-            # Hardware alerts might need attention
-            for item in data:
-                if isinstance(item, dict):
-                    if item.get("usage_cpu_percent", 0) > 90:
-                        return True
         return False
 
     def _asleep_actions(self, sensors_data: Dict[str, List[Any]]) -> None:
@@ -1984,3 +1951,5 @@ if __name__ == "__main__":
         # of waiting for a clean teardown.
         import os as _os
         _os._exit(0)
+
+
