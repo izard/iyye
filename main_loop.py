@@ -172,6 +172,41 @@ if __name__ == '__main__':
     sys.modules.setdefault('main_loop', sys.modules['__main__'])
 
 # --------------------------------------------------------------------------- #
+# STM wrapper for LLM-generated streams
+# --------------------------------------------------------------------------- #
+class _SessionOnlySTM:
+    """Thin proxy around ShortTermMemory that forces generated-stream facts
+    to ``time_frame='session'`` with a fixed provenance prefix.
+
+    LLM-generated codegen streams receive this wrapper instead of the raw
+    STM, so they cannot write durable facts that later seed goal-suggestion
+    loops via ``_find_goal_evidence``.  Read operations (search, get_recent)
+    are delegated unchanged.
+    """
+    __slots__ = ('_stm', '_provenance')
+
+    def __init__(self, stm, provenance: str) -> None:
+        self._stm = stm
+        self._provenance = provenance
+
+    # -- constrained write --
+    def add_fact(self, text, confidence=0.7, provenance=None,
+                 time_frame=None, media_path=None):
+        return self._stm.add_fact(
+            text=text,
+            confidence=confidence,
+            provenance=self._provenance,
+            time_frame='session',
+            media_path=media_path,
+        )
+
+    # -- read-only delegates --
+    def search(self, *a, **kw):        return self._stm.search(*a, **kw)
+    def get_recent(self, *a, **kw):    return self._stm.get_recent(*a, **kw)
+    def save_media(self, *a, **kw):    return self._stm.save_media(*a, **kw)
+
+
+# --------------------------------------------------------------------------- #
 # 4 Brain – orchestrates sensors, memory and streams
 # --------------------------------------------------------------------------- #
 class IyyeBrain:
@@ -470,11 +505,15 @@ class IyyeBrain:
     def _load_streams(self) -> None:
         """Search ./streams/ for .py files and instantiate subclasses of ProcessingStream.
 
-        LLM-generated streams (files starting with 'llm_') are always loaded
-        regardless of _factory_created, because they use no-arg constructors and
-        must survive restarts.  The _factory_created guard only applies to shipped
-        streams like UserChatStream / PlannedContinuationStream that require
-        constructor arguments.
+        LLM-generated stream files (``llm_*``) are short-lived artefacts
+        created by StreamFactory codegen.  They are **not** reloaded on
+        restart — StreamFactory recreates them on demand when fresh sensor
+        data or goal gaps appear.  Stale files left over from a previous
+        session are deleted here so they don't accumulate.
+
+        The _factory_created guard only applies to shipped streams like
+        UserChatStream / PlannedContinuationStream that require constructor
+        arguments.
         """
         streams_dir = PROJECT_ROOT / "streams"
         if not streams_dir.is_dir():
@@ -484,12 +523,16 @@ class IyyeBrain:
         for fname in sorted(os.listdir(streams_dir)):
             if not (fname.endswith(".py") and fname != "__init__.py"):
                 continue
-            # LLM-suggested streams are short-lived and recreated on demand
-            # by StreamFactory when self-reflection generates fresh goals.
-            # Reloading stale ones from a previous session re-introduces
-            # streams that should have been pruned.
-            if fname.startswith("llm_suggested_"):
-                log.debug("Skipping stale LLM-suggested stream file: %s", fname)
+            # LLM-generated stream files are recreated on demand by
+            # StreamFactory.  Delete stale leftovers from previous sessions
+            # so they don't accumulate on disk.
+            if fname.startswith("llm_") and fname != "llm_management_stream.py":
+                stale_path = streams_dir / fname
+                try:
+                    os.remove(stale_path)
+                    log.info("Deleted stale LLM-generated stream file: %s", fname)
+                except OSError as exc:
+                    log.warning("Failed to delete stale stream file %s: %s", fname, exc)
                 continue
             is_llm_generated = fname.startswith("llm_")
             mod_name = fname[:-3]
@@ -851,8 +894,17 @@ class IyyeBrain:
                 continue
             if stream.name in self._SPECIAL_STREAM_NAMES:
                 continue
+            # LLM-generated streams get a constrained STM wrapper that
+            # forces time_frame='session' and a fixed provenance, so
+            # their facts cannot seed goal-suggestion feedback loops.
+            if getattr(stream, '_source_file', None) and self.stm:
+                ctx = {**context, 'stm': _SessionOnlySTM(
+                    self.stm, f"llm_gen:{stream.name}",
+                )}
+            else:
+                ctx = context
             try:
-                result = stream.execute(context)
+                result = stream.execute(ctx)
                 if result:
                     results.append(result)
                 if stream.name not in _REPLAY_SKIP_LLM:
@@ -1951,5 +2003,4 @@ if __name__ == "__main__":
         # of waiting for a clean teardown.
         import os as _os
         _os._exit(0)
-
-
+        
