@@ -28,12 +28,13 @@ import json
 import time
 import atexit
 import logging
+import threading
 import multiprocessing as mp
 from datetime import datetime, timezone
 from enum import Enum, auto
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Callable, Optional
+from typing import Any, Deque, Dict, List, Callable, Optional, Tuple
 
 from iyye_base import PROJECT_ROOT, BaseSensorQueue, BaseActuator, ProcessingStream
 from memory_filters import (
@@ -123,6 +124,41 @@ _LTM_NOISE_RE = re.compile(
 )
 
 # --------------------------------------------------------------------------- #
+# Wind-down pause / settle constants
+# --------------------------------------------------------------------------- #
+# Per-stream join budget during settle.  Set low enough that a stuck thread
+# (e.g. blocked LLM start) doesn't push sleep latency past acceptable.
+_PAUSE_SETTLE_TIMEOUT_S = 5.0
+# Total wall-clock cap across all streams' settle calls.  Wakeup health checks
+# reconcile any state that didn't make it under the wire.
+_PAUSE_SETTLE_TOTAL_S   = 15.0
+
+# --------------------------------------------------------------------------- #
+# In-sleep wakeup policy
+# --------------------------------------------------------------------------- #
+# HLD: Telegram users are untrusted by default.  By default only a *trusted*
+# Telegram sender can force an urgent wakeup; messages from unknown senders
+# are queued for the next natural wakeup instead of interrupting sleep.  Set
+# IYYE_TELEGRAM_URGENT_WAKE=1 to additionally allow urgent-keyword messages
+# from untrusted senders to wake the system (opt-in, looser policy).
+_TELEGRAM_URGENT_WAKE = bool(os.getenv("IYYE_TELEGRAM_URGENT_WAKE", ""))
+# Per-sensor cap on input buffered during sleep awaiting natural wakeup, so a
+# flood of untrusted traffic cannot grow memory without bound.  Newest kept.
+_DEFERRED_INPUT_CAP = 500
+
+# --------------------------------------------------------------------------- #
+# Inter-stream mailbox: pause-time delivery policy
+# --------------------------------------------------------------------------- #
+# Message actions that a *paused* recipient (winding-down) may still drain and
+# act on immediately.  Empty by default: during wind-down all streams are
+# paused and their handlers spawn background work (LLM starts, codegen) that
+# pause explicitly forbids, so acting on such a message mid-pause would be a
+# no-op that silently consumes it — better to defer to the next awake tick.
+# A message can opt in regardless by setting ``"urgent": True``, but only do so
+# when its handler is genuinely pause-safe (in-memory state, no new threads).
+_URGENT_MAILBOX_ACTIONS: frozenset = frozenset()
+
+# --------------------------------------------------------------------------- #
 # Logging configuration – easy to turn on/off from the command line.
 # --------------------------------------------------------------------------- #
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -206,6 +242,44 @@ class _SessionOnlySTM:
     def save_media(self, *a, **kw):    return self._stm.save_media(*a, **kw)
 
 
+class _GraduatedSTM:
+    """STM proxy for *graduated* generated streams.
+
+    Unlike :class:`_SessionOnlySTM`, a graduated stream has proven useful over
+    several awake cycles, so it is allowed to contribute durable knowledge:
+    its facts keep a promotable ``time_frame`` (session/ephemeral are upgraded
+    to ``recent`` so sleep replay doesn't discard them) and a
+    ``gen_graduated:<name>`` provenance that ``_promote_stm_to_ltm`` accepts
+    (it matches none of the LTM skip prefixes/keywords).  This is what lets a
+    stable handler's learning actually accumulate in long-term memory.
+    """
+    __slots__ = ('_stm', '_provenance')
+
+    # time_frames that would be filtered out before LTM — coerced upward so a
+    # graduated stream's facts are eligible for promotion.
+    _NON_DURABLE = frozenset({None, '', 'session', 'ephemeral'})
+
+    def __init__(self, stm, provenance: str) -> None:
+        self._stm = stm
+        self._provenance = provenance
+
+    def add_fact(self, text, confidence=0.7, provenance=None,
+                 time_frame=None, media_path=None):
+        tf = 'recent' if time_frame in self._NON_DURABLE else time_frame
+        return self._stm.add_fact(
+            text=text,
+            confidence=confidence,
+            provenance=self._provenance,
+            time_frame=tf,
+            media_path=media_path,
+        )
+
+    # -- read-only delegates --
+    def search(self, *a, **kw):        return self._stm.search(*a, **kw)
+    def get_recent(self, *a, **kw):    return self._stm.get_recent(*a, **kw)
+    def save_media(self, *a, **kw):    return self._stm.save_media(*a, **kw)
+
+
 # --------------------------------------------------------------------------- #
 # 4 Brain – orchestrates sensors, memory and streams
 # --------------------------------------------------------------------------- #
@@ -262,9 +336,39 @@ class IyyeBrain:
         self._clean_polluted_ltm()
 
         # ------------------------------------------------------------------- #
+        # Event journal — single ordered source of truth for the memory
+        # pipeline.  Phase 1: written in shadow alongside the existing stores
+        # (STM JSONL, streams_history, io_history, last_conscious_log); later
+        # phases derive STM/replay from it.  Created before STM so STM can
+        # emit stm_fact/stm_merge events into it.
+        # ------------------------------------------------------------------- #
+        from event_journal import EventJournal
+        self.journal = EventJournal()
+        self._journal_cycle: int = int(self._load_iyye_state().get("journal_cycle", 0))
+        self.journal.start_cycle(self._journal_cycle)
+
+        # ------------------------------------------------------------------- #
         # Short-term memory (structured fact store, in-memory + daily JSONL)
         # ------------------------------------------------------------------- #
         self.stm = ShortTermMemory()
+        # Let STM mirror fact adds/merges into the journal (shadow), then make
+        # the journal authoritative: recover any facts the JSONL cache lost
+        # (Phase 3 — STM is a projection of the journal; JSONL is a cache).
+        self.stm.journal = self.journal
+        try:
+            self.stm.reconcile_with_journal(
+                self.journal.read_cycle(self._journal_cycle)
+            )
+        except Exception as exc:
+            log.warning("STM journal reconciliation failed: %s", exc)
+
+        # ------------------------------------------------------------------- #
+        # Long term plans — durable across sleep cycles and restarts (HLD:
+        # "Long term plans").  One shared store: PlannerStream drives it, chat
+        # plan actions read it, and the in-sleep deadline check polls it.
+        # ------------------------------------------------------------------- #
+        from plans import PlanStore
+        self.plan_store = PlanStore()
 
         # ------------------------------------------------------------------- #
         # Processing streams – loaded dynamically.
@@ -283,25 +387,45 @@ class IyyeBrain:
         self._attention_stream: Optional[ProcessingStream] = None
         self._waking_interrupted: bool = False
         self._waking_up_tick: int = 0
-        self.last_conscious_log: List[Dict[str, Any]] = self._load_last_cycle()
+        # Monotonic wake-cycle counter ("epoch").  Stamped onto every async LLM
+        # job by the scheduler; results from a cycle that has since ended are
+        # discarded on poll.  Bumped in _enter_waking_up.
+        self._wake_epoch: int = 0
+        # Streams that held consciousness during the current awake cycle.
+        # Reset per cycle in _enter_waking_up (the start of the cycle) — NOT in
+        # _enter_awake, which runs *after* the interrupt path's conscious
+        # selection and would otherwise wipe that stream's credit.  Initialised
+        # here so the very first interrupted wakeup can't hit an AttributeError
+        # (conscious selection happens before _enter_awake on that path).
+        self._was_conscious_streams: set = set()
         self.winding_down_started: bool = False
         self._wakeup_reason: Optional[str] = None
         # Lightweight inter-stream mailbox.  Any stream can post a message
         # addressed to another stream by name; the recipient drains its
-        # mailbox at the start of its execute() tick.
+        # mailbox at the start of its execute() tick.  Guarded by a lock
+        # because background threads (alignment LLM scoring, LLM start/stop)
+        # can post concurrently with the main loop — e.g. a scoring thread
+        # calling router.get_client() → _request_ensure_role() → post_message.
         self._mailboxes: Dict[str, List[Dict[str, Any]]] = {}
-        # Sleep-phase tracking — reset in _enter_asleep, consumed in _asleep_actions
-        self._sleep_did_system_check: bool = False
-        self._sleep_did_stm_flush: bool = False
-        self._sleep_did_replay: bool = False
-        self._sleep_prewarm_sent: bool = False
+        self._mailbox_lock = threading.Lock()
+        # User input that arrived during sleep but did not warrant an urgent
+        # wakeup (e.g. untrusted Telegram).  Merged into the first awake tick
+        # by _merge_deferred_sensor_data so it is processed, not dropped.
+        self._deferred_sleep_sensors: Dict[str, List[Any]] = {}
+        # Names of generated streams that have graduated (proven useful over
+        # several cycles).  Maintained by StreamFactory; consulted in
+        # _run_regular_streams to grant durable-fact STM permissions.
+        self._graduated_stream_names: set = set()
+        # Per-cycle tally of facts a graduated stream contributed that survived
+        # sleep replay into LTM.  Written in _promote_stm_to_ltm, consumed by
+        # StreamFactory's end-of-cycle evaluation, then reset.
+        self._graduated_fact_credit: Dict[str, int] = {}
+        # Names of sleep-housekeeping phases already completed this cycle.
+        # Reset in _enter_asleep; consumed by the sleep-phase scheduler.
+        self._sleep_phases_done: set = set()
         # HLD: "dreaming" replay is skipped on the very first sleep of this process run.
         self._is_first_sleep: bool = True
-        # Cursor may have been restored from last_cycle.json by _load_last_cycle;
-        # fall back to 0 if not (first run or old-format file).
-        self._replay_cursor: int = getattr(self, '_replay_cursor', 0)
 
-    _LAST_CYCLE_PATH = PROJECT_ROOT / "last_cycle.json"
     _IYYE_STATE_PATH = PROJECT_ROOT / "iyye_state.json"
 
     def _load_iyye_state(self) -> Dict[str, Any]:
@@ -316,7 +440,10 @@ class IyyeBrain:
     def _save_iyye_state(self) -> None:
         """Persist brain state counters and stream_factory registry to disk."""
         try:
-            data: Dict[str, Any] = {"iyye_day": self.iyye_day}
+            data: Dict[str, Any] = {
+                "iyye_day": self.iyye_day,
+                "journal_cycle": getattr(self, "_journal_cycle", 0),
+            }
             # Persist stream_factory's goal coverage registry so it
             # survives restarts — prevents duplicate goal streams.
             factory = next(
@@ -330,70 +457,6 @@ class IyyeBrain:
             )
         except Exception as exc:
             log.warning("Could not save iyye_state.json: %s", exc)
-
-    def _load_last_cycle(self) -> List[Dict[str, Any]]:
-        """Load the previous awake cycle's log and replay cursor from disk."""
-        try:
-            if not self._LAST_CYCLE_PATH.exists():
-                return []
-            data = json.loads(self._LAST_CYCLE_PATH.read_text(encoding="utf-8"))
-
-            # New format: {"entries": [...], "cursor": N}
-            # Old format: plain list (backward compat)
-            if isinstance(data, dict):
-                raw = data.get("entries", [])
-                saved_cursor = int(data.get("cursor", 0))
-            elif isinstance(data, list):
-                raw = data
-                saved_cursor = 0
-            else:
-                log.warning("last_cycle.json: unrecognised format — ignoring")
-                return []
-
-            valid = [e for e in raw if isinstance(e, dict) and 'result' in e]
-            dropped = len(raw) - len(valid)
-            if dropped:
-                log.warning("last_cycle.json: dropped %d malformed entries", dropped)
-
-            # Restore cursor so replay resumes where it left off across restarts.
-            self._replay_cursor = min(saved_cursor, len(valid))
-            log.info("Loaded last_conscious_log from %s (%d entries, cursor=%d)",
-                     self._LAST_CYCLE_PATH, len(valid), self._replay_cursor)
-            return valid
-        except Exception as exc:
-            log.warning("Could not load last cycle log: %s", exc)
-        return []
-
-    def _save_last_cycle(self) -> None:
-        """Persist the current awake cycle's log and replay cursor to disk.
-
-        No entries are trimmed — HLD requires "replaying full conscious stream
-        from last awake cycle memory".  Replay is already incremental (batches
-        of _REPLAY_BATCH per sleep tick) so large logs don't cause a spike.
-        """
-        entries = self.last_conscious_log
-        cursor = getattr(self, '_replay_cursor', 0)
-
-        if not entries:
-            # Replay completed (or no awake cycle yet) — remove the file so a
-            # restart doesn't re-replay the same cycle.
-            try:
-                if self._LAST_CYCLE_PATH.exists():
-                    self._LAST_CYCLE_PATH.unlink()
-                    log.info("Cleared last_cycle.json (replay completed)")
-            except Exception as exc:
-                log.warning("Could not remove last_cycle.json: %s", exc)
-            return
-        try:
-            self._LAST_CYCLE_PATH.write_text(
-                json.dumps({"entries": entries, "cursor": cursor},
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            log.info("Saved last_conscious_log to %s (%d entries, cursor=%d)",
-                     self._LAST_CYCLE_PATH, len(entries), cursor)
-        except Exception as exc:
-            log.warning("Could not save last cycle log: %s", exc)
 
     # --------------------------------------------------------------- #
     # One-time LTM cleanup (removes polluted planned-stream pseudo-facts)
@@ -603,11 +666,13 @@ class IyyeBrain:
         from streams.stm_update_stream import StmUpdateStream
         from streams.llm_management_stream import LlmManagementStream
         from streams.theory_of_mind_stream import TheoryOfMindStream
+        from streams.planner_stream import PlannerStream
 
         # Create special streams if not already present
         special_names = {'attention_stream', 'alignment_stream',
                         'stream_factory', 'self_reflection', 'adenosine_stream',
-                        'stm_update', 'llm_management', 'theory_of_mind'}
+                        'stm_update', 'llm_management', 'theory_of_mind',
+                        'planner'}
         existing_names = {s.name for s in self.streams}
 
         for name in special_names - existing_names:
@@ -633,6 +698,8 @@ class IyyeBrain:
                 stream = LlmManagementStream(self)
             elif name == 'theory_of_mind':
                 stream = TheoryOfMindStream(self)
+            elif name == 'planner':
+                stream = PlannerStream(self)
             else:
                 continue
 
@@ -663,7 +730,14 @@ class IyyeBrain:
                     log.warning("Sensor %s poll error: %s", name, exc)
             payloads = q.pop_all()
             if payloads:
-                sensors_data[name] = [_stamp(p) for p in payloads]
+                stamped = [_stamp(p) for p in payloads]
+                sensors_data[name] = stamped
+                # Shadow-journal raw sensor inputs (HLD: collected in all
+                # states).  Best-effort; never let journaling break the tick.
+                journal = getattr(self, 'journal', None)
+                if journal is not None:
+                    for item in stamped:
+                        journal.append('sensor_input', sensor=name, payload=item)
 
         # ------------------------------------------------------------------- #
         # Dispatch based on current state
@@ -860,7 +934,9 @@ class IyyeBrain:
         self, sensors_data: Dict[str, List[Any]],
     ) -> Dict[str, List[Any]]:
         """Inject sensor payloads that were stashed during prior transitions."""
+        _dict_attrs = ('_waking_up_sensors_data', '_deferred_sleep_sensors')
         for attr in ('_waking_up_sensors_data',
+                     '_deferred_sleep_sensors',
                      '_pending_interrupt_data',
                      '_pending_factory_replay'):
             stashed = getattr(self, attr, None)
@@ -869,7 +945,7 @@ class IyyeBrain:
                     if items:
                         sensors_data.setdefault(name, [])
                         sensors_data[name] = items + sensors_data[name]
-                setattr(self, attr, {} if attr == '_waking_up_sensors_data' else None)
+                setattr(self, attr, {} if attr in _dict_attrs else None)
         return sensors_data
 
     def _build_tick_context(self, sensors_data: Dict[str, List[Any]]) -> dict:
@@ -882,8 +958,51 @@ class IyyeBrain:
             'adenosine': self.adenosine.level,
             'tick_counter': getattr(self, '_tick_counter', 0),
             'actuators': self.actuators,
-            'self_reflection_state': getattr(self, '_self_reflection_snapshot', None),
+            'self_reflection_state': self.self_reflection_snapshot(),
         }
+
+    def stream_views(self):
+        """Immutable read-only snapshots of all active streams.
+
+        The cross-stream *query* contract: attention/alignment/factory/
+        self-reflection inspect peers through these views instead of holding
+        raw mutable stream objects (so internals can change freely and an
+        observer cannot mutate a peer)."""
+        return [s.to_view() for s in self.streams]
+
+    def stream_view(self, name: str):
+        """View of a single stream by name, or None."""
+        for s in self.streams:
+            if s.name == name:
+                return s.to_view()
+        return None
+
+    def theory_of_mind(self):
+        """Stable accessor for the Theory-of-Mind stream (or None if not yet
+        started).  Consumers use this instead of reaching for the private
+        ``_tom_stream`` attribute."""
+        return getattr(self, '_tom_stream', None)
+
+    def self_reflection_snapshot(self):
+        """Stable accessor for the latest self-reflection system snapshot."""
+        return getattr(self, '_self_reflection_snapshot', None)
+
+    def _stream_by_name(self, name: str):
+        """Resolve a stream name to the live object (brain-internal use)."""
+        for s in self.streams:
+            if s.name == name:
+                return s
+        return None
+
+    def record_alignment(self, scores_by_name: Dict[str, Dict[str, float]]) -> None:
+        """Apply alignment scores to streams (the owner applies them).
+
+        The alignment stream computes scores from read-only views and hands
+        them here instead of writing into peer stream objects directly."""
+        for name, scores in (scores_by_name or {}).items():
+            stream = self._stream_by_name(name)
+            if stream is not None:
+                stream.alignment_scores = scores
 
     def _run_regular_streams(self, context: dict) -> List[Any]:
         """Execute non-special, non-conscious subconscious streams."""
@@ -894,26 +1013,89 @@ class IyyeBrain:
                 continue
             if stream.name in self._SPECIAL_STREAM_NAMES:
                 continue
-            # LLM-generated streams get a constrained STM wrapper that
-            # forces time_frame='session' and a fixed provenance, so
-            # their facts cannot seed goal-suggestion feedback loops.
-            if getattr(stream, '_source_file', None) and self.stm:
-                ctx = {**context, 'stm': _SessionOnlySTM(
-                    self.stm, f"llm_gen:{stream.name}",
-                )}
+            # LLM-generated streams run with a capability-scoped context (no
+            # raw brain / actuators / cross-stream / LTM-write).  Shipped,
+            # reviewed streams keep the full context.
+            if getattr(stream, '_source_file', None):
+                ctx = self._scoped_context_for(stream, context)
             else:
                 ctx = context
             try:
                 result = stream.execute(ctx)
                 if result:
                     results.append(result)
-                if stream.name not in _REPLAY_SKIP_LLM:
-                    self.add_to_stream_log(stream, result)
+                # Stream activity is captured by the event journal via
+                # ProcessingStream.add_to_log (stream_activity events); no
+                # separate last_conscious_log capture is needed.
             except StopIteration:
                 log.info("Stream %s stopped at checkpoint", stream.name)
             except Exception as exc:
                 log.error("Subconscious stream %s error: %s", stream.name, exc)
         return results
+
+    def _scoped_context_for(self, stream: ProcessingStream, base: dict) -> dict:
+        """Build a least-privilege context for an LLM-generated stream.
+
+        Drops the broad raw handles — all actuators, every other stream object,
+        and the raw LTM client — and swaps in scoped façades: a stage-scoped
+        STM wrapper (session for candidates, durable for graduated), read-only
+        LTM, and a ``cap`` handle.  Sensor inputs and adenosine/tick pass
+        through (reads).  Graduated streams additionally receive a mediated,
+        rate-limited ``emit`` (Phase 2)."""
+        from capabilities import ReadOnlyMemory, Capabilities
+        graduated = stream.name in self._graduated_stream_names
+        if self.stm is None:
+            stm = None
+        elif graduated:
+            stm = _GraduatedSTM(self.stm, f"gen_graduated:{stream.name}")
+        else:
+            stm = _SessionOnlySTM(self.stm, f"llm_gen:{stream.name}")
+        ro_mem = ReadOnlyMemory(self.memory)
+        emit_fn = self._emitter_for(stream) if graduated else None
+        cap = Capabilities(
+            stm=stm, memory=ro_mem, stream=stream,
+            tier=('graduated' if graduated else 'candidate'), emit_fn=emit_fn,
+        )
+        ctx = dict(base)
+        ctx['stm'] = stm
+        ctx['memory'] = ro_mem        # read-only façade (writes raise)
+        ctx['streams'] = []           # no cross-stream access
+        ctx['actuators'] = {}         # no direct actuator access
+        ctx['current_conscious'] = None
+        ctx['cap'] = cap
+        # Read scoping: a generated stream sees only the sensor(s) it was
+        # registered for.  _cap_sensors is stamped at creation/reload from the
+        # coverage key — a sensor handler gets {its_sensor}, a goal stream gets
+        # the empty set (it works from STM/memory, not raw sensor data).
+        allowed = getattr(stream, '_cap_sensors', None)
+        if allowed is not None:
+            sd = base.get('sensors_data', {}) or {}
+            ctx['sensors_data'] = {k: v for k, v in sd.items() if k in allowed}
+        return ctx
+
+    def _web_chat_actuator(self):
+        """Return the local web-chat actuator (the only channel generated
+        streams may reach), or None."""
+        for name, act in self.actuators.items():
+            if 'web' in name.lower() or 'chat' in name.lower():
+                return act
+        return None
+
+    def _emitter_for(self, stream: ProcessingStream):
+        """Mediated, rate-limited output grant for a *graduated* stream.
+
+        Routes only through the local web chat (never Telegram/TTS) and caps
+        messages per awake cycle.  The emitter is cached on the stream so its
+        per-cycle counter persists across ticks; it is reset in _enter_awake."""
+        from capabilities import MediatedEmitter
+        em = getattr(stream, '_cap_emitter', None)
+        if em is None:
+            em = MediatedEmitter(self._web_chat_actuator(), stream.name)
+            try:
+                stream._cap_emitter = em
+            except Exception:
+                return None
+        return em
 
     def _ensure_conscious_stream(self) -> None:
         """Select a conscious stream if none is currently assigned."""
@@ -937,7 +1119,7 @@ class IyyeBrain:
         current_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
         try:
             result = current_conscious.execute(context)
-            self.add_to_stream_log(current_conscious, result)
+            # Activity captured by the journal (stream_activity events).
             # The stream may have retired itself (removed from self.streams)
             # during execute().  Clear the pointer so the next tick picks fresh.
             if current_conscious not in self.streams:
@@ -981,11 +1163,19 @@ class IyyeBrain:
         if not (attention_result and attention_result.get('promote')):
             return
 
+        # Attention returns the NAME to promote (read contract); resolve it to
+        # the live stream here.
+        promote_name = attention_result['promote']
+        target = self._stream_by_name(promote_name)
+        if target is None:
+            log.warning("Attention: promote target %r not found", promote_name)
+            return
+
         old_conscious = self._current_conscious
         if old_conscious:
             old_conscious.is_conscious = False
             old_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
-        self._current_conscious = attention_result['promote']
+        self._current_conscious = target
         self._current_conscious.is_conscious = True
         self._current_conscious._last_conscious_tick = getattr(self, '_tick_counter', 0)
         self._was_conscious_streams.add(self._current_conscious.name)
@@ -1009,142 +1199,20 @@ class IyyeBrain:
             self.state = MindState.WINDING_DOWN
             self.winding_down_started = False
 
-    def _check_system_state(self) -> Dict[str, Any]:
-        """
-        HLD: "It starts with checking the Iyye system state: inputs, actuators, 
-        memory, hardware it runs on, etc."
-        """
-        import psutil
-    
-        state = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'sensors': {
-                name: {
-                    'queue_size': len(q),
-                    'maxlen': q.maxlen if hasattr(q, 'maxlen') else None,
-                }
-                for name, q in self.sensors.items()
-            },
-            'actuators': list(self.actuators.keys()),
-            'memory_facts': self.memory.count(),
-            'active_streams': len(self.streams),
-            'conscious_stream': getattr(self._current_conscious, 'name', None) 
-                                if hasattr(self, '_current_conscious') else None,
-            'hardware': {
-                'cpu_percent': psutil.cpu_percent(interval=0.1),
-                'memory_percent': psutil.virtual_memory().percent,
-                'disk_percent': psutil.disk_usage('/').percent,
-            },
-            'adenosine': self.adenosine.level,
-        }
-    
-        log.info("System state check: %d sensors, %d actuators, %d streams, "
-                "CPU=%.1f%%, Mem=%.1f%%",
-                len(self.sensors), len(self.actuators), len(self.streams),
-                state['hardware']['cpu_percent'], state['hardware']['memory_percent'])
+    def _run_system_check(self) -> Dict[str, Any]:
+        """Drive the asleep system-check.
 
-        self._write_system_description(state)
-        return state
+        HLD assigns the system-description to SelfReflectionStream, so the
+        brain (scheduler) delegates to it when it is running.  On the very
+        first sleep — before subconscious streams are started — self-reflection
+        does not exist yet, so the brain bootstraps the check directly via the
+        same shared producer in ``system_description``."""
+        from system_description import run_system_check
+        sr = next((s for s in self.streams if s.name == 'self_reflection'), None)
+        if sr is not None and callable(getattr(sr, 'perform_system_check', None)):
+            return sr.perform_system_check()
+        return run_system_check(self)
 
-    def _write_system_description(self, state: Dict[str, Any]) -> None:
-        """
-        HLD: "After checking the system, markdown file is created that describes
-        the system to be used by awake execution streams."
-        """
-        hw = state['hardware']
-        ts = state['timestamp']
-
-        sensors_md = "\n".join(
-            f"- **{name}**: queue {info['queue_size']} items"
-            for name, info in state['sensors'].items()
-        ) or "_(none)_"
-
-        actuators_md = "\n".join(
-            f"- **{name}**" for name in state['actuators']
-        ) or "_(none)_"
-
-        current_conscious_name = getattr(self._current_conscious, 'name', None) \
-            if hasattr(self, '_current_conscious') else None
-        streams_md = "\n".join(
-            f"- **{s.name}** (priority={s.priority},"
-            f" can_be_conscious={getattr(s, '_can_be_conscious', False)},"
-            f" is_conscious={s.name == current_conscious_name})"
-            for s in self.streams
-        ) or "_(none)_"
-
-        conscious_name = state.get('conscious_stream') or "_(none)_"
-
-        lines = [
-            "# Iyye System Description",
-            f"_Generated: {ts} UTC_",
-            "",
-            "## Hardware",
-            f"| Resource | Usage |",
-            f"|----------|-------|",
-            f"| CPU      | {hw['cpu_percent']:.1f}% |",
-            f"| Memory   | {hw['memory_percent']:.1f}% |",
-            f"| Disk     | {hw['disk_percent']:.1f}% |",
-            "",
-            "## Sensors",
-            sensors_md,
-            "",
-            "## Actuators",
-            actuators_md,
-            "",
-            "## Execution Streams",
-            f"Active: {state['active_streams']}  |  Conscious: {conscious_name}",
-            "",
-            streams_md,
-            "",
-            "## Long-term Memory",
-            f"Stored facts: {state['memory_facts']}",
-            "",
-            "## Adenosine",
-            f"Level: {state['adenosine']:.3f} / {self.adenosine.MAX:.1f}",
-            "",
-        ]
-
-        md_path = PROJECT_ROOT / "system_description.md"
-        try:
-            md_path.write_text("\n".join(lines), encoding="utf-8")
-            log.info("System description written to %s", md_path)
-        except Exception as exc:
-            log.warning("Failed to write system description: %s", exc)
-
-    def add_to_stream_log(self, stream: ProcessingStream, result: Any) -> None:
-        """Record stream activity for later replay during sleep.
-
-        Called for conscious and eligible subconscious streams so that
-        the dreaming phase can extract facts from all meaningful work,
-        not just the focused stream.
-        """
-        if not hasattr(self, 'last_conscious_log'):
-            self.last_conscious_log = []
-
-        # Use the stream's full activity_log (human-readable, includes all user
-        # messages and responses).  We track how many entries we have already
-        # snapshotted for this stream so each tick only appends new lines rather
-        # than re-capturing a fixed tail — ensuring no entries are ever dropped.
-        seen_key = f"_stream_log_seen_{stream.name}"
-        seen = getattr(self, seen_key, 0)
-        activity = getattr(stream, 'activity_log', [])
-        new_entries = activity[seen:]
-        setattr(self, seen_key, len(activity))
-
-        if new_entries:
-            text = '\n'.join(new_entries)
-        elif result is not None:
-            text = str(result)[:500]
-        else:
-            return  # nothing new to record
-
-        self.last_conscious_log.append({
-            'stream': stream.name,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'result': text,
-            'adenosine': self.adenosine.level,
-            'alignment_scores': getattr(stream, 'alignment_scores', {}),
-        })
 
     def _winding_down_actions(self) -> None:
         """
@@ -1169,14 +1237,30 @@ class IyyeBrain:
 
             # HLD: "conscious processing stream stops" — request an explicit
             # stop so it can abort in-progress work at its next checkpoint.
-            # HLD: "all subconscious streams pause" — subconscious streams are
-            # paused implicitly: the state machine stops calling execute() once
-            # the brain leaves AWAKE.  Their state (activity logs, alignment
-            # scores, cursors) is preserved across the sleep cycle.
             if self._current_conscious is not None:
                 self._current_conscious.request_stop()
                 log.info("Requested conscious stream %s to stop",
                          self._current_conscious.name)
+
+            # HLD: "all subconscious streams pause" — set the pause flag now
+            # so background work (alignment LLM scoring, LLM start/stop
+            # threads) stops spawning even before the conscious stream has
+            # reached its checkpoint.  Threads already in flight are joined
+            # by _settle_subconscious_streams() below.
+            for stream in self.streams:
+                if stream is self._current_conscious:
+                    continue
+                try:
+                    stream.pause()
+                except Exception as exc:
+                    log.warning("pause() failed for %s: %s", stream.name, exc)
+
+            # Stop the async LLM scheduler accepting new jobs.  In-flight jobs
+            # keep running; they are bounded-joined in _settle_subconscious_streams
+            # and any that don't finish have their results discarded on next wake.
+            sch = getattr(self, 'llm_scheduler', None)
+            if sch is not None:
+                sch.begin_pause()
 
         # Wait for conscious stream to finish any in-progress work.
         current_conscious = self._current_conscious
@@ -1187,12 +1271,56 @@ class IyyeBrain:
             current_conscious.is_conscious = False
             self._current_conscious = None
 
+        # Drain in-flight background threads with a bounded budget, then flush
+        # per-stream persistent state via on_pause().  This is the second phase
+        # of the HLD pause protocol — first phase (the flag) was set above.
+        self._settle_subconscious_streams()
+
         self.winding_down_started = False
         # HLD odd req: push "starting sleep" while actuators are still alive.
         self._push_to_web_chat("starting sleep")
         self._stop_actuators()
         self._enter_asleep()
- 
+
+    def _settle_subconscious_streams(self) -> None:
+        """Wait briefly for stream background threads to drain, then flush.
+
+        HLD: "all subconscious streams pause" — after pause() blocks new
+        background work, settle() joins in-flight threads with a per-stream
+        timeout and a total wall-clock cap.  on_pause() then runs for each
+        stream so persistent in-memory state (e.g. ToM dirty contacts) gets
+        flushed before _enter_asleep snapshots the brain.
+        """
+        deadline = time.monotonic() + _PAUSE_SETTLE_TOTAL_S
+        for stream in self.streams:
+            if stream is self._current_conscious:
+                continue
+            remaining = max(0.1, deadline - time.monotonic())
+            budget = min(_PAUSE_SETTLE_TIMEOUT_S, remaining)
+            try:
+                if not stream.settle(timeout_s=budget):
+                    log.warning(
+                        "Stream %s did not settle within %.1fs — daemon "
+                        "threads may still mutate state past sleep boundary",
+                        stream.name, budget,
+                    )
+            except Exception as exc:
+                log.warning("settle() failed for %s: %s", stream.name, exc)
+            try:
+                stream.on_pause()
+            except Exception as exc:
+                log.warning("on_pause() failed for %s: %s", stream.name, exc)
+
+        # Bounded-drain in-flight async LLM jobs within the remaining budget.
+        sch = getattr(self, 'llm_scheduler', None)
+        if sch is not None:
+            remaining = max(0.1, deadline - time.monotonic())
+            if not sch.settle(min(_PAUSE_SETTLE_TIMEOUT_S, remaining)):
+                log.warning(
+                    "LLM scheduler did not drain in-flight jobs before sleep — "
+                    "their results will be discarded on next wake",
+                )
+
     def _stop_actuators(self) -> None:
         """Gracefully stop all actuators.  HLD: 'no actuators are running' during sleep."""
         for name, actuator in self.actuators.items():
@@ -1232,10 +1360,38 @@ class IyyeBrain:
             self.iyye_day += 1
             self._save_iyye_state()
         self._awake_tick_count = 0
-        self._was_conscious_streams: set = set()
+        # _was_conscious_streams is reset in _enter_waking_up (cycle start), not
+        # here — the interrupt path selects its conscious stream before
+        # _enter_awake runs, so resetting here would erase that stream's credit.
+        # Lift the wind-down pause so streams can spawn background work again.
+        # Missing this call would silently leave alignment scoring and LLM
+        # management disabled after the first sleep cycle.
+        for stream in self.streams:
+            try:
+                stream.resume()
+            except Exception as exc:
+                log.warning("resume() failed for %s: %s", stream.name, exc)
+            # Reset per-cycle mediated-emit budgets for graduated streams.
+            em = getattr(stream, '_cap_emitter', None)
+            if em is not None:
+                em.reset()
         log.info("Transition → AWAKE (Iyye day %d, interrupted=%s)",
                  self.iyye_day, self._waking_interrupted)
         self.state = MindState.AWAKE
+
+    def _rotate_journal_cycle(self) -> None:
+        """Open a fresh journal partition once a cycle's events are replayed.
+
+        Mirrors the clearing of last_cycle.json: after replay consumes a
+        cycle's events, subsequent events belong to the next cycle.  The
+        new cycle id is persisted so a restart resumes the right partition."""
+        journal = getattr(self, 'journal', None)
+        if journal is None:
+            return
+        self._journal_cycle = getattr(self, '_journal_cycle', 0) + 1
+        journal.start_cycle(self._journal_cycle)
+        self._save_iyye_state()
+        log.debug("Journal rotated to cycle %d", self._journal_cycle)
 
     def _enter_asleep(self) -> None:
         """Return to ASLEEP state and prepare streams for the next wake cycle."""
@@ -1255,34 +1411,26 @@ class IyyeBrain:
         # Reset so _start_subconscious_streams runs again on next WAKING_UP
         # (creates only missing streams; existing ones keep their state).
         self._subconscious_started = False
-        # Reset sleep-phase flags so each new sleep cycle runs all phases.
-        # Do NOT reset _replay_cursor — replay resumes where it left off so that
-        # a restart or an interrupt wakeup doesn't throw away already-done work.
-        self._sleep_did_system_check = False
-        self._sleep_did_stm_flush = False
-        self._sleep_did_replay = False
-        self._sleep_prewarm_sent = False
+        # Reset sleep-phase completion so each new sleep cycle runs all phases.
+        self._sleep_phases_done = set()
 
-        # If we're re-entering sleep after an interrupted wakeup that added
-        # new awake-cycle entries, the STM fact snapshot from the previous
-        # replay is stale — it was taken before the awake cycle created new
-        # facts.  Delete the snapshot so _replay_batch rebuilds it from the
-        # current STM.  Keep _replay_processed_stm so already-promoted facts
-        # are not re-promoted.  _replay_stm_cursor resets to 0 since the
-        # new sorted list has a different shape.
-        if hasattr(self, '_replay_stm_sorted'):
-            del self._replay_stm_sorted
-            self._replay_stm_cursor = 0
+        # Journal replay: drop the cached event list + pairing so the next
+        # sleep re-reads the (now longer) append-only partition.  Keep the
+        # cursor / promoted-set / discovered list — the partition's processed
+        # prefix is stable, so we resume rather than re-promote.  This also
+        # covers the interrupted-wakeup case (the awake cycle appended more
+        # events to the same partition; we resume past the processed prefix).
+        for attr in ('_jreplay_events', '_jreplay_fact_activity',
+                     '_jreplay_activity_facts'):
+            try:
+                delattr(self, attr)
+            except AttributeError:
+                pass
 
-        # Flush Theory-of-Mind contacts so interactions posted in the last
-        # tick (after ToM's final execute()) are not lost.
-        tom = getattr(self, '_tom_stream', None)
-        if tom is not None and callable(getattr(tom, 'flush', None)):
-            tom.flush()
-
-        # Persist the awake cycle log before the replay phase clears it,
-        # so the dreaming/replay phase works correctly after a restart.
-        self._save_last_cycle()
+        # ToM dirty contacts were already flushed by on_pause() during
+        # _settle_subconscious_streams().  The crash-path flush in
+        # _save_iyye_state remains as a safety net for KeyboardInterrupt /
+        # OS exit that skips the normal winding-down sequence.
 
         # "starting sleep" was already pushed by _winding_down_actions before
         # actuators were stopped.
@@ -1328,12 +1476,69 @@ class IyyeBrain:
     # Inter-stream mailbox
     # --------------------------------------------------------------- #
     def post_message(self, target: str, message: Dict[str, Any]) -> None:
-        """Post *message* to the mailbox of the stream named *target*."""
-        self._mailboxes.setdefault(target, []).append(message)
+        """Post *message* to *target*'s mailbox (thread-safe).
 
-    def drain_messages(self, target: str) -> List[Dict[str, Any]]:
-        """Return and clear all pending messages for *target*."""
-        return self._mailboxes.pop(target, [])
+        Safe to call from background threads (the lock serialises concurrent
+        posts/drains).  *message* is a typed ``messaging.Message`` (preferred,
+        built via ``Messages.*``) or a legacy dict — both are normalized to a
+        validated Message here.  A message may set ``urgent`` (or use an action
+        in ``_URGENT_MAILBOX_ACTIONS``) to request delivery even while the
+        recipient is paused during wind-down — see ``drain_messages``.
+        """
+        from messaging import normalize_message
+        msg = normalize_message(target, message)
+        with self._mailbox_lock:
+            self._mailboxes.setdefault(target, []).append(msg)
+
+    def drain_messages(
+        self, target: str, urgent_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return pending messages for *target*, removing them (thread-safe).
+
+        With ``urgent_only=False`` (awake default) all messages are returned
+        and the mailbox cleared.  With ``urgent_only=True`` — used by a paused
+        stream during wind-down — only urgent control messages are returned;
+        the rest stay queued, preserving order, for the next awake tick.  This
+        is the explicit "which messages may be drained while winding down"
+        policy: by default nothing is urgent, so a paused consumer defers
+        everything (sleep quieting) unless a message opted in as pause-safe.
+        """
+        with self._mailbox_lock:
+            if not urgent_only:
+                return self._mailboxes.pop(target, [])
+            queue = self._mailboxes.get(target)
+            if not queue:
+                return []
+            urgent, deferred = [], []
+            for m in queue:
+                (urgent if self._is_urgent_message(m) else deferred).append(m)
+            if deferred:
+                self._mailboxes[target] = deferred
+            else:
+                self._mailboxes.pop(target, None)
+            return urgent
+
+    def peek_messages(self, target: str) -> List[Dict[str, Any]]:
+        """Return a copy of *target*'s pending messages without removing them.
+
+        Thread-safe read for callers that need to test for pending mail (e.g.
+        ToM blocking wind-down until its mailbox is drained) without consuming
+        it or touching the shared dict directly."""
+        with self._mailbox_lock:
+            return list(self._mailboxes.get(target, ()))
+
+    @staticmethod
+    def _is_urgent_message(message: Any) -> bool:
+        """True if *message* may be delivered to a paused recipient.
+
+        Works for both ``messaging.Message`` and legacy dicts (both expose
+        ``.get`` and an ``action``/``urgent``)."""
+        get = getattr(message, "get", None)
+        if not callable(get):
+            return False
+        if get("urgent"):
+            return True
+        return get("action") in _URGENT_MAILBOX_ACTIONS
 
     # --------------------------------------------------------------- #
     # Graceful shutdown
@@ -1343,13 +1548,19 @@ class IyyeBrain:
         # Flush Theory-of-Mind contacts before anything else — catches
         # interactions posted after the last ToM execute() or during a
         # crash/exit that skipped the normal WINDING_DOWN path.
-        tom = getattr(self, '_tom_stream', None)
+        tom = self.theory_of_mind()
         if tom is not None and callable(getattr(tom, 'flush', None)):
             tom.flush()
-        # Persist the awake-cycle log so the next sleep phase can replay it,
-        # even when the process exits via timeout or KeyboardInterrupt rather
-        # than going through the full WINDING_DOWN → ASLEEP sequence.
-        self._save_last_cycle()
+        # Stop async LLM scheduler workers.
+        sch = getattr(self, 'llm_scheduler', None)
+        if sch is not None:
+            try:
+                sch.close()
+            except Exception:
+                pass
+        # The awake cycle's activity is already durably in the event journal
+        # (stream_activity / stm_fact events), so there's no separate cycle log
+        # to persist here — replay folds the journal on the next sleep.
         self._save_iyye_state()
         # Stop background-thread sensors so their executor threads don't keep
         # the process alive after the main loop exits.
@@ -1364,40 +1575,58 @@ class IyyeBrain:
             self.memory.close()
         except Exception:  # pragma: no‑cover – defensive
             pass
+        journal = getattr(self, 'journal', None)
+        if journal is not None:
+            try:
+                journal.close()
+            except Exception:
+                pass
+
+    # Keywords that escalate a message to an "urgent" wake.  For web chat the
+    # local owner is trusted so any message wakes; these only refine the logged
+    # reason.  For Telegram they matter only under the opt-in urgent policy.
+    _URGENT_KEYWORDS = ('urgent', 'emergency', 'help', 'important', 'wake')
 
     def _check_wakeup_triggers(self, sensors_data: Dict[str, List[Any]]) -> bool:
         """
-        HLD: "Each important input source has a simple in-sleep processing routine 
-        that checks if latest input item should force wakeup."
+        HLD: "Each important input source has a simple in-sleep processing routine
+        that checks if latest input item should force urgent wakeup."
+
+        "Input arrived" is deliberately distinct from "urgent wake":
+        - web_chat is the local, fully-trusted owner → any message wakes.
+        - microphone wake words and critical hardware readings → wake.
+        - Telegram is untrusted by default (HLD): only a *trusted* sender
+          forces a wake.  Messages from senders Iyye has not been told to
+          trust are left queued and handled at the next natural wakeup (see
+          _defer_sleep_input), so untrusted traffic can no longer repeatedly
+          interrupt sleep, sap partial adenosine, or stall day-advancement
+          and replay.  IYYE_TELEGRAM_URGENT_WAKE opts in to also waking on
+          urgent-keyword messages from untrusted senders.
         """
-        # Web chat messages always trigger wakeup
+        # Web chat — trusted local owner; any message is an explicit request.
         if "web_chat" in sensors_data and sensors_data["web_chat"]:
             for msg in sensors_data["web_chat"]:
-                # Check for urgent keywords
-                if isinstance(msg, str):
-                    msg_lower = msg.lower()
-                    urgent_keywords = ['urgent', 'emergency', 'help', 'important', 'wake']
-                    if any(kw in msg_lower for kw in urgent_keywords):
-                        self._wakeup_reason = f"urgent web_chat message: {msg[:50]}"
-                        log.info("Wakeup triggered by urgent web_chat input")
-                        return True
-            # Non-urgent messages still trigger wakeup but with lower priority
+                if isinstance(msg, str) and any(
+                    kw in msg.lower() for kw in self._URGENT_KEYWORDS
+                ):
+                    self._wakeup_reason = f"urgent web_chat message: {msg[:50]}"
+                    log.info("Wakeup triggered by urgent web_chat input")
+                    return True
+            self._wakeup_reason = "web_chat message"
             log.info("Wakeup triggered by web_chat input")
             return True
 
-        # Check microphone sensor for wake words
+        # Microphone wake words.
         if "microphone_sensor" in sensors_data and sensors_data["microphone_sensor"]:
             for transcription in sensors_data["microphone_sensor"]:
                 if isinstance(transcription, dict):
                     text = transcription.get("text", "").lower()
-                    # Check for wake words
-                    wake_words = ['iyye', 'hey iyye', 'wake up']
-                    if any(ww in text for ww in wake_words):
+                    if any(ww in text for ww in ('iyye', 'hey iyye', 'wake up')):
                         self._wakeup_reason = f"wake word detected: {text[:50]}"
                         log.info("Wakeup triggered by wake word")
                         return True
-    
-        # Check hardware sensor for critical conditions.
+
+        # Critical hardware conditions.
         for key in sensors_data:
             if 'hardware' in key.lower():
                 for reading in sensors_data[key]:
@@ -1413,83 +1642,259 @@ class IyyeBrain:
                         self._wakeup_reason = "critical memory usage"
                         log.info("Wakeup triggered by hardware alert (mem %.1f%%)", mem)
                         return True
-    
-        # Telegram messages trigger wakeup on any real message.
-        # New direct sensor format: each item is a message dict with 'update_id'.
-        # Legacy MCP batch format: each item is {'count': N, 'messages': [...]}.
+
+        # Telegram — untrusted by default.  Only a trusted sender (or, under
+        # the opt-in urgent policy, an urgent-keyword message) forces a wake.
+        # Everything else is deferred to natural wakeup by _defer_sleep_input.
         for key in sensors_data:
             if 'telegram' not in key.lower():
                 continue
+            saw_untrusted = False
             for item in sensors_data[key]:
-                if isinstance(item, dict):
-                    if (item.get('count', 0) > 0 or item.get('messages')
-                            or 'update_id' in item):
-                        self._wakeup_reason = f"telegram message on {key}"
-                        log.info("Wakeup triggered by Telegram input (%s)", key)
+                msgs = self._iter_telegram_messages(item)
+                if not msgs:
+                    saw_untrusted = saw_untrusted or bool(item)
+                    continue
+                for m in msgs:
+                    if self._telegram_message_trusted(m, key):
+                        sender = (m.get('first_name') or m.get('username')
+                                  or 'trusted contact')
+                        self._wakeup_reason = f"trusted Telegram message from {sender}"
+                        log.info("Wakeup triggered by trusted Telegram sender (%s)", key)
                         return True
-                elif item:  # plain non-empty string / other truthy value
-                    self._wakeup_reason = f"telegram message on {key}"
-                    log.info("Wakeup triggered by Telegram input (%s)", key)
-                    return True
+                    if _TELEGRAM_URGENT_WAKE:
+                        text = str(m.get('text') or '').lower()
+                        if any(kw in text for kw in self._URGENT_KEYWORDS):
+                            self._wakeup_reason = f"urgent Telegram message on {key}"
+                            log.info("Wakeup triggered by urgent Telegram input "
+                                     "under opt-in policy (%s)", key)
+                            return True
+                    saw_untrusted = True
+            if saw_untrusted:
+                log.info("Telegram input on %s from untrusted sender(s) — deferring "
+                         "to natural wakeup", key)
 
-        # Don't check git sensor for code changes, only self can write to git
+        # Long term plan deadlines — the scheduler input (HLD: a deadline on
+        # an active plan step is a valid urgent-wakeup source, same mechanism
+        # as a high priority sensor input).  Cheap in-memory timestamp check.
+        try:
+            due = self.plan_store.next_due_deadline()
+            if due is not None and due <= datetime.now(timezone.utc):
+                self._wakeup_reason = f"plan step due at {due.isoformat()}"
+                log.info("Wakeup triggered by long term plan deadline")
+                return True
+        except Exception as exc:
+            log.warning("Plan deadline wakeup check failed: %s", exc)
 
+        # Don't check git sensor for code changes, only self can write to git.
         return False
+
+    @staticmethod
+    def _iter_telegram_messages(item: Any) -> List[Dict[str, Any]]:
+        """Normalize a raw Telegram sensor payload into a list of message dicts.
+
+        Handles the direct per-message dict ({'text','chat_id','user_id',...}),
+        the legacy MCP batch format ({'count': N, 'messages': [...]}), and
+        returns [] for anything without a recognizable message shape (e.g. a
+        bare string or a count-only batch) — those carry no sender identity so
+        they cannot establish trust."""
+        if isinstance(item, dict):
+            msgs = item.get('messages')
+            if isinstance(msgs, list):
+                return [m for m in msgs if isinstance(m, dict)]
+            if 'text' in item or 'chat_id' in item or 'update_id' in item:
+                return [item]
+        return []
+
+    def _telegram_message_trusted(self, msg: Dict[str, Any], source: str) -> bool:
+        """Return True if *msg*'s sender is a trusted Theory-of-Mind contact.
+
+        HLD: a Telegram sender is trusted only after the owner explicitly
+        trusts them via the local web chat (the sole channel that can change
+        trust).  When the ToM stream isn't running yet (the very first sleep
+        of a process, before any wake cycle) nobody is trusted, so untrusted
+        Telegram cannot wake the system."""
+        tom = self.theory_of_mind()
+        if tom is None:
+            return False
+        chat_id = msg.get('chat_id')
+        user_id = msg.get('user_id')
+        if not (chat_id or user_id):
+            return False  # no stable identity → cannot be a trusted contact
+        first = msg.get('first_name') or ''
+        username = msg.get('username') or ''
+        sender = first or (f'@{username}' if username else None)
+        try:
+            cid = tom.make_contact_id(
+                sender, source,
+                int(chat_id) if chat_id else None,
+                int(user_id) if user_id else None,
+            )
+            return bool(tom.is_contact_trusted(cid))
+        except Exception as exc:
+            log.debug("Telegram trust check failed: %s", exc)
+            return False
+
+    def _defer_sleep_input(self, sensors_data: Dict[str, List[Any]]) -> None:
+        """Buffer user input that arrived during sleep but did not warrant an
+        urgent wakeup, so the next natural wakeup processes it instead of
+        dropping it (the payloads were already popped from their queues).
+
+        Only message-bearing sensors (Telegram) are deferred — ephemeral
+        hardware/metric readings are not re-injected.  Buffer is capped per
+        sensor so untrusted floods cannot grow memory without bound."""
+        buf = getattr(self, '_deferred_sleep_sensors', None) or {}
+        for name, items in sensors_data.items():
+            if 'telegram' in name.lower() and items:
+                merged = buf.setdefault(name, [])
+                merged.extend(items)
+                if len(merged) > _DEFERRED_INPUT_CAP:
+                    del merged[:-_DEFERRED_INPUT_CAP]
+        if buf:
+            self._deferred_sleep_sensors = buf
+
+    # Sleep-phase scheduling --------------------------------------------- #
+    # Phases with order < the gate run before the wakeup-trigger check (so the
+    # system description is current even on an interrupt wake); phases ≥ the
+    # gate run after.  The brain owns sequencing + the wakeup/transition
+    # decisions; the *work* of each phase is owned by a stream/producer.
+    _SLEEP_WAKEUP_GATE_ORDER = 50
+    _REPLAY_BATCH = 3  # LLM extraction calls per replay tick
+
+    def _sleep_core_phases(self) -> List["SleepPhase"]:
+        from iyye_base import SleepPhase
+        return [
+            # system check → SelfReflectionStream (owns system_description),
+            # with first-sleep bootstrap inside _run_system_check.
+            SleepPhase("system_check", lambda b: (b._run_system_check(), True)[1], 10),
+            # STM flush → StmUpdateStream (owns fact extraction).
+            SleepPhase("stm_flush", lambda b: b._sleep_phase_stm_flush(), 20),
+            SleepPhase("prewarm",   lambda b: b._sleep_phase_prewarm(), 60),
+            SleepPhase("replay",    lambda b: b._sleep_phase_replay(), 70),
+            SleepPhase("cleanup",   lambda b: b._sleep_phase_cleanup(), 80),
+        ]
+
+    def _sleep_phases(self) -> List["SleepPhase"]:
+        """Assemble the ordered sleep pipeline: brain core phases plus any a
+        stream registers via ``sleep_phases()`` (HLD: housekeeping is stream
+        work; the brain only schedules it)."""
+        phases = list(self._sleep_core_phases())
+        for s in self.streams:
+            try:
+                phases.extend(s.sleep_phases() or [])
+            except Exception as exc:
+                log.warning("sleep_phases() failed for %s: %s", s.name, exc)
+        phases.sort(key=lambda p: p.order)
+        return phases
+
+    def _run_sleep_phases(self, phases, done: set) -> bool:
+        """Run not-yet-done *phases* in order; stop at the first that reports
+        it needs more ticks (e.g. batched replay).  Returns True when all are
+        done."""
+        for ph in phases:
+            if ph.name in done:
+                continue
+            if ph.run(self):
+                done.add(ph.name)
+            else:
+                return False
+        return True
+
+    def _sleep_phase_stm_flush(self) -> bool:
+        stm_stream = next((s for s in self.streams if s.name == 'stm_update'), None)
+        if stm_stream is not None and callable(getattr(stm_stream, 'flush', None)):
+            stm_stream.flush()
+        return True
+
+    def _sleep_phase_prewarm(self) -> bool:
+        router = getattr(self, 'llm_router', None)
+        if router is not None:
+            hp = router._healthy_ports
+            stm_model = router._find_model("stm")
+            if stm_model and hp is not None and stm_model["port"] not in hp:
+                from messaging import Messages
+                self.post_message("llm_management", Messages.ensure_role(
+                    role="stm", model_name=stm_model["name"],
+                    task={"prompt_tokens": 800, "expected_output_tokens": 200,
+                          "quality_need": 0.3, "latency_budget_s": 15,
+                          "urgency": 0.6},
+                    reason="prewarm for sleep replay fact extraction",
+                ))
+        return True
+
+    def _sleep_phase_replay(self) -> bool:
+        """Dreaming: fold this cycle's event journal, one batch per tick.
+
+        Returns True when replay is complete (or skipped on the first sleep).
+
+        Replay's LLM fact-extraction (``_extract_key_facts`` →
+        ``_get_replay_extraction_client``) runs **synchronously**, by design —
+        it is *not* routed through the async LLM scheduler (issue #3).  The
+        scheduler exists to keep blocking LLM calls off the AWAKE main loop;
+        during sleep there is no conscious stream to starve and the loop is
+        otherwise idle, replay is already cooperatively batched
+        (``_REPLAY_BATCH`` extractions per tick), and the scheduler is paused
+        (``begin_pause``) for the duration of sleep.  Making replay async would
+        require running the scheduler during sleep and turning the sleep-phase
+        pipeline into a job-polling state machine — added complexity for no
+        latency benefit.  This is the deliberate resolution of migration
+        step 7; see llm_scheduler_plan.md."""
+        if self._is_first_sleep:
+            self._is_first_sleep = False   # HLD: skip dreaming on first sleep
+            return True
+        if not hasattr(self, '_jreplay_events'):
+            self._replay_journal_init()
+        if self._replay_journal_step(self._REPLAY_BATCH):
+            self._replay_journal_finish()
+            self._rotate_journal_cycle()
+            return True
+        return False  # more replay ticks needed
+
+    def _sleep_phase_cleanup(self) -> bool:
+        # HLD: "keeps deleting the processed part of STM."  Trim in-memory
+        # queues and old on-disk history.
+        for name, q in self.sensors.items():
+            if len(q) > 1000:
+                while len(q) > 500:
+                    q.popleft()
+                log.debug("Trimmed sensor queue: %s", name)
+        self._cleanup_stm_files(keep_days=3)
+        return True
 
     def _asleep_actions(self, sensors_data: Dict[str, List[Any]]) -> None:
         """
         HLD: "Asleep state runs only 'housekeeping' subconscious tasks and
         checks some sensor inputs."
+
+        The brain acts as the *scheduler*: it replenishes adenosine, re-injects
+        deferred input, drives the ordered sleep-housekeeping phase pipeline
+        (whose work is owned by streams/producers), evaluates the wakeup
+        trigger, and performs state transitions.
         """
-        # Replenish adenosine first so the level is current for all decisions this tick.
-        # HLD: "fully replenished adenosine, or partially/proportionally replenished
-        # if waking up because of high priority input interruption."
+        # HLD: adenosine "partially/proportionally replenished" — owned math on
+        # the AdenosineStream; the scheduler decides when to tick it.
         self.adenosine.replenish(0.05)
 
-        # Re-inject any sensor data that was accumulated during WINDING_DOWN.
-        # Those payloads were already popped from queues (and acknowledged by the
-        # MCP server), so we stash them for the first awake tick — but do NOT
-        # let them trigger a wakeup interrupt.  They were already known about
-        # before sleep began; treating them as "new" would cause every sleep
-        # cycle to be interrupted (day counter never advances).
+        # Re-inject sensor data accumulated during WINDING_DOWN (already popped
+        # from queues) for the first awake tick — without treating it as a new
+        # interrupt (else the day counter would never advance).
         saved = getattr(self, '_winding_down_sensors', None)
         if saved:
             self._pending_interrupt_data = saved
             self._winding_down_sensors = {}
 
-        # Phase 1: system check — runs exactly once per sleep cycle.
-        # Must run BEFORE the wakeup-trigger check so that system_description.md
-        # is always current when the first awake stream executes, even on an
-        # interrupt wakeup that skips the rest of the sleep phases.
-        if not self._sleep_did_system_check:
-            self._check_system_state()
-            self._sleep_did_system_check = True
-            # Do not return here — fall through to the wakeup-trigger check so
-            # that an interrupt arriving on the very same tick is not delayed by
-            # one extra sleep tick.
+        phases = self._sleep_phases()
+        done = self._sleep_phases_done
 
-        # Phase 1b: flush StmUpdateStream so chat/telegram entries that were
-        # buffered but not yet extracted (due to LLM_INTERVAL throttle) are
-        # written to STM before replay promotes facts to LTM.  Without this,
-        # a wind-down that arrives mid-throttle loses user facts entirely —
-        # replay skips chat stream text and relies on STM facts existing.
-        if not self._sleep_did_stm_flush:
-            stm_stream = next(
-                (s for s in self.streams if s.name == 'stm_update'), None,
-            )
-            if stm_stream is not None and callable(getattr(stm_stream, 'flush', None)):
-                stm_stream.flush()
-            self._sleep_did_stm_flush = True
+        # Pre-gate housekeeping (system check, STM flush) must complete before
+        # the wakeup check so system_description.md is current even on an
+        # interrupt wake.
+        self._run_sleep_phases(
+            [p for p in phases if p.order < self._SLEEP_WAKEUP_GATE_ORDER], done,
+        )
 
-        # HLD: "Each important input source has a simple in-sleep processing routine
-        # that checks if latest input item should force wakeup."
+        # Wakeup gate (lifecycle decision — stays with the scheduler).
         if self._check_wakeup_triggers(sensors_data):
-            # Adenosine is at whatever partial level sleep has replenished so far —
-            # proportional to time slept, as required by the HLD.
-            # Preserve the triggering sensor data: it was already popped from the
-            # queues by pop_all() and will be gone on the next tick.  Stash it so
-            # _awake_actions() can inject it into the first conscious tick.
-            # Merge with any data already stashed from WINDING_DOWN.
             existing = getattr(self, '_pending_interrupt_data', None) or {}
             for _n, _items in sensors_data.items():
                 existing.setdefault(_n, [])
@@ -1498,72 +1903,17 @@ class IyyeBrain:
             self._enter_waking_up(interrupted=True)
             return
 
-        # Prewarm: request the stm/fast model before replay starts so
-        # fact extraction has a dedicated fast model available.
-        if not self._sleep_did_replay and not getattr(self, '_sleep_prewarm_sent', False):
-            self._sleep_prewarm_sent = True
-            router = getattr(self, 'llm_router', None)
-            if router is not None:
-                hp = router._healthy_ports
-                stm_model = router._find_model("stm")
-                if stm_model and hp is not None and stm_model["port"] not in hp:
-                    self.post_message("llm_management", {
-                        "action": "ensure_role",
-                        "role": "stm",
-                        "model_name": stm_model["name"],
-                        "task": {
-                            "prompt_tokens": 800,
-                            "expected_output_tokens": 200,
-                            "quality_need": 0.3,
-                            "latency_budget_s": 15,
-                            "urgency": 0.6,
-                        },
-                        "reason": "prewarm for sleep replay fact extraction",
-                    })
+        # Preserve deferrable input (e.g. untrusted Telegram) for natural wake.
+        self._defer_sleep_input(sensors_data)
 
-        # Phase 2: replay ("dreaming") — HLD: skipped on the very first sleep of
-        # this process run.  Spreads LLM extraction over multiple sleep ticks.
-        if self._is_first_sleep:
-            self._sleep_did_replay = True   # mark done so we fall through to wakeup
-            self._is_first_sleep = False    # only skip once per process lifetime
-
-        _REPLAY_BATCH = 3  # LLM calls per sleep tick
-        if not self._sleep_did_replay:
-            replay_log = getattr(self, 'last_conscious_log', []) or []
-            cursor = getattr(self, '_replay_cursor', 0)
-            if replay_log and cursor < len(replay_log):
-                batch = replay_log[cursor: cursor + _REPLAY_BATCH]
-                self._replay_batch(batch)
-                self._replay_cursor = cursor + len(batch)
-                if self._replay_cursor >= len(replay_log):
-                    # Final batch — clean up and mark replay done.
-                    self._replay_finish()
-                    self._sleep_did_replay = True
-                    self._replay_cursor = 0
-                    # Durably clear the cycle file so a restart doesn't
-                    # re-replay the same (now empty) cycle.
-                    self._save_last_cycle()
-            else:
-                # No log or already exhausted.
-                self._sleep_did_replay = True
-                self._replay_cursor = 0
-            return  # give this tick to replay
-
-        # HLD: "keeps deleting the processed part of short term memory from last
-        # awake cycle".  Trim both in-memory queues and on-disk STM files.
-        for name, q in self.sensors.items():
-            if len(q) > 1000:
-                while len(q) > 500:
-                    q.popleft()
-                log.debug("Trimmed sensor queue: %s", name)
-        self._cleanup_stm_files(keep_days=3)
-
-        # Both phases complete — fill adenosine to MAX and wake naturally.
-        # Phase 1 (system check) always runs; Phase 2 (dreaming/replay) runs only when
-        # there is a previous-day log.  First sleep skips Phase 2 per HLD.
-        log.info("Sleep phases complete — adenosine filled, natural wakeup")
-        self.adenosine.level = self.adenosine.MAX
-        self._enter_waking_up(interrupted=False)
+        # Post-gate housekeeping (prewarm, dreaming/replay, cleanup).  Replay
+        # yields across ticks; when every post-gate phase is done, wake.
+        if self._run_sleep_phases(
+            [p for p in phases if p.order >= self._SLEEP_WAKEUP_GATE_ORDER], done,
+        ):
+            log.info("Sleep phases complete — adenosine filled, natural wakeup")
+            self.adenosine.level = self.adenosine.MAX
+            self._enter_waking_up(interrupted=False)
 
     def _enter_waking_up(self, interrupted: bool = False) -> None:
         """
@@ -1586,6 +1936,19 @@ class IyyeBrain:
         self.state = MindState.WAKING_UP
         self._waking_interrupted = interrupted
         self._waking_up_tick = 0
+        # Start of a new awake cycle: clear per-cycle conscious tracking before
+        # any stream is selected.  (Selection for the interrupt path happens in
+        # the next tick's _waking_up_actions, after this reset.)
+        self._was_conscious_streams = set()
+        # New wake epoch: bump and resume the async LLM scheduler (re-enable
+        # accepting, drop any results stranded from the previous cycle).  The
+        # scheduler may not exist yet on the very first wakeup — it is created
+        # by LlmManagementStream during _waking_up_actions and adopts the epoch
+        # itself.
+        self._wake_epoch += 1
+        sch = getattr(self, 'llm_scheduler', None)
+        if sch is not None:
+            sch.on_wake(self._wake_epoch)
 
         # _start_subconscious_streams() is called in _waking_up_actions()
 
@@ -1594,13 +1957,20 @@ class IyyeBrain:
         HLD: "keeps deleting the processed part of short term memory from last
         awake cycle (can also compact)."
 
-        Deletes day-log files older than `keep_days` from both io_history/ and
-        streams_history/.  Files are named YYYY-MM-DD.txt; any file whose stem
-        sorts below the cutoff date string is removed.
+        Deletes day-log files older than `keep_days` from:
+        - io_history/<subdir>/YYYY-MM-DD.txt
+        - streams_history/<subdir>/YYYY-MM-DD.txt
+        - stm_history/YYYY-MM-DD.jsonl  (and any media .tgz they reference)
+
+        STM JSONL files persist all facts including those that sleep replay
+        rejected as unpromotable; without this cleanup those files would
+        grow without bound on fact-heavy days.
         """
         from datetime import date, timedelta
         cutoff = (date.today() - timedelta(days=keep_days)).isoformat()
         deleted = 0
+
+        # io_history/ and streams_history/ — txt files under per-source subdirs
         for root_name in ("io_history", "streams_history"):
             root = PROJECT_ROOT / root_name
             if not root.exists():
@@ -1616,8 +1986,63 @@ class IyyeBrain:
                             log.debug("Deleted old STM file: %s", fpath)
                         except Exception as exc:
                             log.warning("Could not delete STM file %s: %s", fpath, exc)
+
+        # stm_history/ — jsonl files at the root; media/ subdir is preserved
+        # (live media references are managed by ShortTermMemory.remove_by_ids).
+        stm_root = PROJECT_ROOT / "stm_history"
+        if stm_root.exists():
+            for fpath in list(stm_root.iterdir()):
+                if not fpath.is_file() or fpath.suffix != ".jsonl":
+                    continue
+                if fpath.stem >= cutoff:
+                    continue
+                # Collect media paths referenced by this day-file so the
+                # .tgz archives don't outlive their JSONL index.  Handles
+                # both the legacy ``media_path`` scalar and the new
+                # ``media_paths`` list produced by dedup merges.
+                media_paths: List[str] = []
+                try:
+                    with fpath.open(encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                fact = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(fact, dict):
+                                continue
+                            mp_list = fact.get("media_paths")
+                            if isinstance(mp_list, list):
+                                media_paths.extend(p for p in mp_list if p)
+                            mp = fact.get("media_path")
+                            if mp:
+                                media_paths.append(mp)
+                except Exception as exc:
+                    log.warning("Could not scan STM file for media %s: %s", fpath, exc)
+                try:
+                    fpath.unlink()
+                    deleted += 1
+                    log.debug("Deleted old STM file: %s", fpath)
+                except Exception as exc:
+                    log.warning("Could not delete STM file %s: %s", fpath, exc)
+                    continue
+                for mp in media_paths:
+                    try:
+                        Path(mp).unlink()
+                    except OSError:
+                        pass  # already gone or never existed
+
         if deleted:
             log.info("STM cleanup: deleted %d file(s) older than %s", deleted, cutoff)
+
+        # Prune old event-journal partitions too — keep roughly the last
+        # `keep_days` cycles (a cycle ≈ a day).  The current cycle is never
+        # pruned by EventJournal.prune.
+        journal = getattr(self, 'journal', None)
+        if journal is not None:
+            journal.prune(keep_after_cycle=getattr(self, '_journal_cycle', 0) - keep_days)
 
     def _fine_tune_dnns(self, discovered_facts: List[Dict[str, Any]]) -> None:
         """
@@ -1642,163 +2067,231 @@ class IyyeBrain:
         
         # TODO: Implement actual fine-tuning using LoRA/QLoRA when models available
 
-    def _replay_batch(self, entries: List[Dict[str, Any]]) -> None:
-        """
-        Process one batch of stream-log entries during sleep replay.
-        Called from _asleep_actions a few entries at a time to avoid blocking
-        the main loop for the full duration of an LLM-heavy replay.
+    # ------------------------------------------------------------------ #
+    # Phase 2: replay by folding the event journal
+    # ------------------------------------------------------------------ #
+    def _replay_journal_init(self) -> None:
+        """Load this cycle's journal events and precompute fact↔activity pairing.
 
-        HLD: "reads temporally associated facts from short term memory" —
-        STM facts are sorted by timestamp and matched to log entries by
-        chronological proximity (not by provenance string).
+        Pairing is plain adjacency: each ``stm_fact`` event is associated with
+        the nearest preceding ``stream_activity`` event (they were appended in
+        true temporal order), so no timestamp parsing or windowed scoring is
+        needed.
 
-        HLD: "keeps deleting the processed part of short term memory from
-        last awake cycle" — promoted STM facts are removed at the end of
-        every batch (not deferred to _replay_finish) so an interrupted
-        replay never re-promotes facts that were already committed to LTM.
-        """
-        stm = getattr(self, 'stm', None)
-
-        # Build (or reuse) the sorted STM fact list for this replay cycle.
-        # After an interrupted wakeup the snapshot is deleted (but
-        # _replay_processed_stm is kept) so we rebuild with fresh STM
-        # facts while still skipping already-promoted ones.
-        if not hasattr(self, '_replay_stm_sorted'):
-            stm_facts = stm.get_all_today() if stm is not None else []
-            self._replay_stm_sorted: List[Dict[str, Any]] = sorted(
-                stm_facts, key=lambda f: f.get('timestamp', ''),
-            )
-            self._replay_stm_cursor: int = 0
-            if not hasattr(self, '_replay_processed_stm'):
-                self._replay_processed_stm: set = set()
-            if not hasattr(self, '_replay_discovered'):
-                self._replay_discovered: List[Dict[str, Any]] = []
-            log.info(
-                "Sleep replay %s: %d total entries, %d STM facts, %d already promoted",
-                "resuming" if self._replay_processed_stm else "starting",
-                len(getattr(self, 'last_conscious_log', [])),
-                len(stm_facts),
-                len(self._replay_processed_stm),
-            )
-
-        sorted_facts = self._replay_stm_sorted
-        cursor = self._replay_stm_cursor
-        processed_stm_ids = self._replay_processed_stm
-        discovered_facts = self._replay_discovered
-
-        # IDs promoted in THIS batch — deleted from STM at the end.
-        batch_promoted_ids: List[str] = []
-
-        for entry in entries:
-            stream_name = entry.get('stream', 'unknown')
-            entry_ts = entry.get('timestamp', '')
-
-            # 1. Promote temporally associated STM facts → LTM.
-            # Advance the cursor through facts whose timestamps are ≤ this
-            # entry's timestamp, pairing them with the closest log entry.
-            while cursor < len(sorted_facts):
-                fact = sorted_facts[cursor]
-                if fact.get('timestamp', '') > entry_ts:
-                    break
-                cursor += 1
-                if fact['id'] not in processed_stm_ids:
-                    fact_id = self._promote_stm_to_ltm(fact, entry)
-                    if fact_id:
-                        processed_stm_ids.add(fact['id'])
-                        batch_promoted_ids.append(fact['id'])
-                        discovered_facts.append({'id': fact_id, 'text': fact['text']})
-
-            # 2. LLM fact extraction — skip for chat/telegram (user messages are
-            #    not useful LTM material) and for subconscious bookkeeping streams
-            #    that log only housekeeping output.
-            sn_lower = stream_name.lower()
-            skip_llm = (
-                any(kw in sn_lower for kw in ('chat', 'telegram'))
-                or stream_name in _REPLAY_SKIP_LLM
-                or any(sn_lower.startswith(p) for p in _REPLAY_SKIP_PREFIXES)
-                or any(kw in sn_lower for kw in _REPLAY_SKIP_KEYWORDS)
-            )
-            text = entry.get('result', '')
-            # Also skip if ALL lines are metric snapshots — saves an LLM call
-            # for the common case where self_reflection logged only "[Day N] CPU=…".
-            if text and not skip_llm:
-                meaningful_lines = [
-                    ln for ln in text.splitlines()
-                    if ln.strip() and not _EPHEMERAL_METRIC_RE.search(ln)
-                ]
-                if not meaningful_lines:
-                    skip_llm = True
-                else:
-                    text = '\n'.join(meaningful_lines)
-            if text and not skip_llm:
-                key_facts = self._extract_key_facts(text, stream_name=stream_name)
-                for fact in key_facts:
-                    if _EPHEMERAL_METRIC_RE.search(fact):
-                        continue  # never store transient metric snapshots in LTM
-                    if _LTM_NOISE_RE.search(fact):
-                        continue  # skip placeholders and system-status sentences
-                    stored_id = self.memory.store_fact(
-                        text=fact,
-                        confidence=0.7,
-                        source=stream_name,
-                        provenance=(
-                            f"Extracted during sleep replay from '{stream_name}'"
-                            f" at {entry.get('timestamp')}"
-                        ),
-                        time_frame='permanent',
-                    )
-                    discovered_facts.append({'id': stored_id, 'text': fact})
-
-        # Persist cursor position for the next batch.
-        self._replay_stm_cursor = cursor
-
-        # Progressive STM cleanup: delete facts promoted in this batch
-        # immediately so an interrupt wakeup can't re-promote them.
-        if stm is not None and batch_promoted_ids:
-            stm.remove_by_ids(batch_promoted_ids)
-            log.debug("Replay batch: promoted and removed %d STM fact(s)",
-                      len(batch_promoted_ids))
-
-    def _replay_finish(self) -> None:
-        """
-        Called after the final replay batch to promote remaining STM facts,
-        clean up, and run HLD housekeeping (what-if, fine-tune).
-
-        Most promoted STM facts were already deleted per-batch in
-        _replay_batch.  This method handles the tail: STM facts whose
-        timestamps fell after the last log entry.
-        """
-        stm = getattr(self, 'stm', None)
-        processed_stm_ids: set = getattr(self, '_replay_processed_stm', set())
-        discovered_facts: List[Dict[str, Any]] = getattr(self, '_replay_discovered', [])
-        sorted_facts: List[Dict[str, Any]] = getattr(self, '_replay_stm_sorted', [])
-        cursor: int = getattr(self, '_replay_stm_cursor', 0)
-
-        # Promote any STM facts past the cursor (timestamps after last entry).
-        tail_ids: List[str] = []
-        for fact in sorted_facts[cursor:]:
-            if fact['id'] not in processed_stm_ids:
-                fact_id = self._promote_stm_to_ltm(fact, entry=None)
-                if fact_id:
-                    processed_stm_ids.add(fact['id'])
-                    tail_ids.append(fact['id'])
-                    discovered_facts.append({'id': fact_id, 'text': fact['text']})
-
-        if stm is not None and tail_ids:
-            stm.remove_by_ids(tail_ids)
-
-        log.info(
-            "Sleep replay done: promoted %d fact(s) to LTM total (%d in tail)",
-            len(processed_stm_ids), len(tail_ids),
+        Replay is made **idempotent** so a mid-replay process restart cannot
+        re-promote facts or repeat extraction: progress is reconstructed from
+        the journal itself.  Every STM fact replay consumes is removed via a
+        ``stm_remove`` event, and every stream_activity whose key-fact
+        extraction ran emits an ``extracted`` event — so on a cold start we
+        re-seed the processed/extracted sets from those events and skip
+        anything already done (rather than relying on an in-memory cursor that
+        a crash would lose).  Within a process, the sets simply persist across
+        ticks and across an interrupted wakeup."""
+        cid = getattr(self, '_journal_cycle', 0)
+        journal = getattr(self, 'journal', None)
+        self._jreplay_events: List[Dict[str, Any]] = (
+            journal.read_cycle(cid) if journal is not None else []
         )
+        # fact_id -> activity event; activity index -> [paired fact texts]
+        self._jreplay_fact_activity: Dict[str, Dict[str, Any]] = {}
+        self._jreplay_activity_facts: Dict[int, List[str]] = {}
+        last_act: Optional[int] = None
+        for i, e in enumerate(self._jreplay_events):
+            etype = e.get('type')
+            if etype == 'stream_activity':
+                last_act = i
+            elif etype == 'stm_fact' and last_act is not None:
+                fid = e.get('fact_id')
+                if fid:
+                    self._jreplay_fact_activity[fid] = self._jreplay_events[last_act]
+                    self._jreplay_activity_facts.setdefault(last_act, []).append(
+                        e.get('text', '')
+                    )
 
-        self._fine_tune_dnns(discovered_facts)
-        self._run_what_if_simulations(self.last_conscious_log)
-        self.last_conscious_log = []
+        # Reconstruct durable progress on a cold start.  These sets persist in
+        # memory across ticks/interrupts within a process; after a restart they
+        # are rebuilt from the journal so already-done work is not repeated.
+        restored = False
+        if not hasattr(self, '_jreplay_promoted'):
+            processed: set = set()
+            for e in self._jreplay_events:
+                t = e.get('type')
+                if t == 'stm_remove':
+                    # Every STM fact replay consumed (promoted or discarded).
+                    processed.update(e.get('ids') or [])
+                elif t == 'ltm_promotion':
+                    # A promotion is journaled per-fact *before* the batched
+                    # stm_remove at the end of the step.  Seeding from these
+                    # too closes the crash window where a fact was promoted to
+                    # LTM but the process died before stm_remove was appended —
+                    # otherwise that fact would be promoted a second time.
+                    fid = e.get('fact_id')
+                    if fid:
+                        processed.add(fid)
+            self._jreplay_promoted = processed
+            restored = bool(processed)
+        if not hasattr(self, '_jreplay_extracted'):
+            self._jreplay_extracted = {
+                e.get('activity_seq') for e in self._jreplay_events
+                if e.get('type') == 'extracted' and e.get('activity_seq') is not None
+            }
+            restored = restored or bool(self._jreplay_extracted)
+        if not hasattr(self, '_jreplay_cursor'):
+            self._jreplay_cursor = 0
+        if not hasattr(self, '_jreplay_discovered'):
+            self._jreplay_discovered: List[Dict[str, Any]] = []
+        if self._jreplay_events:
+            log.info(
+                "Sleep replay (journal) %s: cycle %d, %d events, %d facts paired, "
+                "%d already processed, %d already extracted",
+                "resuming" if (restored or self._jreplay_promoted) else "starting",
+                cid, len(self._jreplay_events),
+                len(self._jreplay_fact_activity), len(self._jreplay_promoted),
+                len(self._jreplay_extracted),
+            )
 
-        # Clean up per-replay scratch attributes.
-        for attr in ('_replay_stm_sorted', '_replay_stm_cursor',
-                     '_replay_processed_stm', '_replay_discovered'):
+    def _replay_activity_extractable(
+        self, stream_name: str, text: str,
+    ) -> Optional[str]:
+        """Return the meaningful (non-metric) text to extract from a
+        stream_activity event, or None when it should be skipped — same policy
+        as the legacy replay (chat/telegram and housekeeping streams skipped,
+        pure metric snapshots dropped)."""
+        if not text:
+            return None
+        sn = stream_name.lower()
+        if (any(kw in sn for kw in ('chat', 'telegram'))
+                or stream_name in _REPLAY_SKIP_LLM
+                or any(sn.startswith(p) for p in _REPLAY_SKIP_PREFIXES)
+                or any(kw in sn for kw in _REPLAY_SKIP_KEYWORDS)):
+            return None
+        lines = [
+            ln for ln in text.splitlines()
+            if ln.strip() and not _EPHEMERAL_METRIC_RE.search(ln)
+        ]
+        if not lines:
+            return None
+        return '\n'.join(lines)
+
+    def _replay_journal_step(self, batch_limit: int) -> bool:
+        """Process journal events from the cursor; return True when finished.
+
+        Walks events in order: ``stm_fact`` → promote the (live) STM fact to
+        LTM with its paired activity as provenance; ``stream_activity`` → LLM
+        key-fact extraction (capped at *batch_limit* LLM calls per tick).
+        Processed STM facts are deleted from STM in step (HLD: "keeps deleting
+        the processed part of STM"), so an interrupt can't re-promote them."""
+        events = self._jreplay_events
+        cursor = self._jreplay_cursor
+        stm = getattr(self, 'stm', None)
+        live_by_id = (
+            {f['id']: f for f in stm.get_all_today()} if stm is not None else {}
+        )
+        extractions = 0
+        step_removed: List[str] = []
+
+        while cursor < len(events):
+            e = events[cursor]
+            etype = e.get('type')
+
+            if etype == 'stm_fact':
+                fid = e.get('fact_id')
+                if fid and fid not in self._jreplay_promoted:
+                    self._jreplay_promoted.add(fid)
+                    fact = live_by_id.get(fid) or {
+                        'id': fid,
+                        'text': e.get('text', ''),
+                        'confidence': e.get('confidence', 0.7),
+                        'provenance': e.get('provenance', ''),
+                        'time_frame': e.get('time_frame', 'permanent'),
+                    }
+                    paired = self._jreplay_fact_activity.get(fid)
+                    entry = (
+                        {'stream': paired.get('stream'), 'timestamp': paired.get('ts')}
+                        if paired else None
+                    )
+                    ltm_id = self._promote_stm_to_ltm(fact, entry)
+                    if ltm_id:
+                        self._jreplay_discovered.append(
+                            {'id': ltm_id, 'text': fact.get('text', '')}
+                        )
+                        if getattr(self, 'journal', None) is not None:
+                            self.journal.append(
+                                'ltm_promotion', ltm_id=ltm_id,
+                                fact_id=fid, src_seq=e.get('seq'),
+                                text=fact.get('text', '')[:200],
+                            )
+                    step_removed.append(fid)
+
+            elif etype == 'stream_activity':
+                seq = e.get('seq')
+                # Skip activities whose extraction already ran (durably marked
+                # by an `extracted` event) — prevents repeat extraction after a
+                # mid-replay restart.
+                if seq in self._jreplay_extracted:
+                    cursor += 1
+                    continue
+                clean = self._replay_activity_extractable(
+                    e.get('stream', 'unknown'), e.get('text', ''),
+                )
+                if clean is not None:
+                    if extractions >= batch_limit:
+                        break  # resume next tick (cursor not advanced past this)
+                    extractions += 1
+                    stream_name = e.get('stream', 'unknown')
+                    paired_facts = self._jreplay_activity_facts.get(cursor, [])
+                    key_facts = self._extract_key_facts(
+                        clean, stream_name=stream_name, paired_facts=paired_facts,
+                    )
+                    # Mark extraction done BEFORE writing the facts to LTM.  The
+                    # LLM call above has no LTM side effects, so a crash during
+                    # it simply re-extracts harmlessly; but a crash *mid-store*
+                    # must not repeat the whole extraction on restart (that would
+                    # duplicate facts in LTM).  Marking first makes extraction
+                    # at-most-once: a partial store may drop a few re-derivable
+                    # facts, which is preferable to duplicating them.
+                    self._jreplay_extracted.add(seq)
+                    if getattr(self, 'journal', None) is not None:
+                        self.journal.append('extracted', activity_seq=seq)
+                    for kf in key_facts:
+                        if _EPHEMERAL_METRIC_RE.search(kf) or _LTM_NOISE_RE.search(kf):
+                            continue
+                        sid = self.memory.store_fact(
+                            text=kf, confidence=0.7, source=stream_name,
+                            provenance=(
+                                f"Extracted during sleep replay from "
+                                f"'{stream_name}' at {e.get('ts')}"
+                            ),
+                            time_frame='permanent',
+                        )
+                        self._jreplay_discovered.append({'id': sid, 'text': kf})
+
+            cursor += 1
+
+        self._jreplay_cursor = cursor
+        if stm is not None and step_removed:
+            stm.remove_by_ids(step_removed)
+            log.debug("Replay (journal): removed %d processed STM fact(s)",
+                      len(step_removed))
+        return cursor >= len(events)
+
+    def _replay_journal_finish(self) -> None:
+        """Run end-of-replay housekeeping and clear journal-replay scratch."""
+        discovered = getattr(self, '_jreplay_discovered', [])
+        self._fine_tune_dnns(discovered)
+        # What-if reads conscious decisions (alignment_scores) directly from the
+        # journal's stream_activity events — no separate last_conscious_log.
+        decisions = [
+            {'alignment_scores': e.get('alignment_scores') or {},
+             'result': e.get('text', '')}
+            for e in getattr(self, '_jreplay_events', [])
+            if e.get('type') == 'stream_activity' and e.get('alignment_scores')
+        ]
+        self._run_what_if_simulations(decisions)
+        log.info("Sleep replay (journal) done: %d item(s) to LTM", len(discovered))
+        for attr in ('_jreplay_events', '_jreplay_cursor', '_jreplay_promoted',
+                     '_jreplay_extracted', '_jreplay_discovered',
+                     '_jreplay_fact_activity', '_jreplay_activity_facts'):
             try:
                 delattr(self, attr)
             except AttributeError:
@@ -1841,57 +2334,77 @@ class IyyeBrain:
                     f" (stream '{entry.get('stream')}'"
                     f" at {entry.get('timestamp')})"
                 )
-            return self.memory.store_fact(
+            # LTM's pyarrow schema stores a single media_path; if the STM
+            # fact accumulated multiple archives via dedup merges, pass the
+            # first and log so the loss is visible.  Follow-up: extend LTM
+            # schema to a list.
+            from iyye_io.short_term_memory import media_paths_of
+            paths = media_paths_of(stm_fact)
+            if len(paths) > 1:
+                log.info(
+                    "STM→LTM: fact has %d media archives; promoting first only "
+                    "(LTM is single-media): %s",
+                    len(paths), stm_fact.get('text', '')[:80],
+                )
+            ltm_id = self.memory.store_fact(
                 text=stm_fact['text'],
                 confidence=float(stm_fact.get('confidence', 0.7)),
                 source=stm_fact.get('provenance', 'agent'),
                 provenance=provenance,
                 time_frame=stm_fact.get('time_frame', 'permanent'),
-                media_path=stm_fact.get('media_path'),
+                media_path=paths[0] if paths else None,
             )
+            # Credit a graduated generated stream when its fact reaches LTM —
+            # this is a concrete impact signal the factory uses to keep the
+            # stream graduated (or demote it if it stops contributing).
+            if ltm_id and prov.startswith('gen_graduated:'):
+                name = prov.split(':', 1)[1].split(',', 1)[0].strip()
+                if name:
+                    self._graduated_fact_credit[name] = (
+                        self._graduated_fact_credit.get(name, 0) + 1
+                    )
+            return ltm_id
         except Exception as exc:
             log.warning("Failed to promote STM fact to LTM: %s", exc)
             return None
 
-    def _extract_key_facts(self, text: str, stream_name: str = "unknown") -> List[str]:
+    def _extract_key_facts(
+        self,
+        text: str,
+        stream_name: str = "unknown",
+        paired_facts: Optional[List[str]] = None,
+    ) -> List[str]:
         """
         Extract key facts from conscious stream text using LLM.
         Falls back to heuristic extraction if the LLM is unreachable.
-        """
-        try:
-            from llm_client import LLMClient
-            client = LLMClient(no_think=True)
-            response = client.complete_from_file(
-                "extract_facts",
-                stream_name=stream_name,
-                stream_output=text,
-            )
-            facts = []
-            for line in response.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                # Skip lines that are clearly LLM reasoning artefacts
-                if _LTM_NOISE_RE.search(line):
-                    continue
-                if _EPHEMERAL_METRIC_RE.search(line):
-                    continue
-                # Skip HTML / thinking tags
-                if line.startswith('<') and '>' in line:
-                    continue
-                # Skip markdown headings and horizontal rules
-                if line.startswith('#') or line == '---':
-                    continue
-                # Skip very short lines (likely fragments)
-                if len(line) < 10:
-                    continue
-                facts.append(line)
-            log.debug("LLM extracted %d facts from %s", len(facts), stream_name)
-            return facts[:10]
-        except Exception as exc:
-            log.warning("LLM fact extraction failed, using heuristic fallback: %s", exc)
 
-        # Heuristic fallback
+        ``paired_facts`` are STM facts that the replay pairing step
+        associated with this log entry — used as additional context per
+        HLD ("processes [temporally associated facts] using LLM inference").
+        """
+        # Format paired-fact context block for the prompt template.  Empty
+        # list collapses to a "(none)" sentinel so the prompt stays valid.
+        if paired_facts:
+            paired_block = "\n".join(f"- {pf}" for pf in paired_facts[:10])
+        else:
+            paired_block = "(none)"
+        client = self._get_replay_extraction_client()
+        if client is not None:
+            try:
+                response = client.complete_from_file(
+                    "extract_facts",
+                    stream_name=stream_name,
+                    stream_output=text,
+                    paired_facts=paired_block,
+                )
+                return self._parse_extracted_facts(response, stream_name)
+            except Exception as exc:
+                log.warning("LLM fact extraction failed for %s, using heuristic "
+                            "fallback: %s", stream_name, exc)
+
+        # Heuristic fallback — reached when the router/LLM is unavailable or the
+        # extraction call raised.  Lower quality; the warnings above make the
+        # degradation visible rather than silent.
         facts = []
         for sentence in text.replace('!', '.').replace('?', '.').split('.'):
             s = sentence.strip()
@@ -1900,6 +2413,62 @@ class IyyeBrain:
                                                    'determined', 'concluded', 'noted']):
                     facts.append(s)
         return facts[:5]
+
+    def _get_replay_extraction_client(self):
+        """Return an LLM client for sleep-replay fact extraction.
+
+        Routes through ``brain.llm_router`` using the same ``stm`` role the
+        sleep prewarm requested (see _asleep_actions), so extraction uses the
+        prewarmed/fast model and inherits router health checks, role selection,
+        and model lifecycle.  Only when the router is unavailable (LLM
+        management stream never started) does it fall back to a bare
+        LLMClient — logged clearly so degraded routing is visible.
+
+        Returns None if even the fallback client cannot be constructed; the
+        caller then uses heuristic extraction.
+        """
+        router = getattr(self, 'llm_router', None)
+        if router is not None:
+            try:
+                return router.get_client(role="stm", no_think=True)
+            except Exception as exc:
+                log.warning("Replay extraction: router.get_client(role='stm') "
+                            "failed (%s) — falling back to default LLMClient", exc)
+        else:
+            log.warning("Replay extraction: llm_router unavailable — falling back "
+                        "to default LLMClient (no role routing or health checks)")
+        try:
+            from llm_client import LLMClient
+            return LLMClient(no_think=True)
+        except Exception as exc:
+            log.warning("Replay extraction: could not construct fallback "
+                        "LLMClient (%s) — using heuristic extraction", exc)
+            return None
+
+    def _parse_extracted_facts(self, response: str, stream_name: str) -> List[str]:
+        """Filter raw LLM extraction output into clean fact lines."""
+        facts: List[str] = []
+        for line in response.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Skip lines that are clearly LLM reasoning artefacts
+            if _LTM_NOISE_RE.search(line):
+                continue
+            if _EPHEMERAL_METRIC_RE.search(line):
+                continue
+            # Skip HTML / thinking tags
+            if line.startswith('<') and '>' in line:
+                continue
+            # Skip markdown headings and horizontal rules
+            if line.startswith('#') or line == '---':
+                continue
+            # Skip very short lines (likely fragments)
+            if len(line) < 10:
+                continue
+            facts.append(line)
+        log.debug("LLM extracted %d facts from %s", len(facts), stream_name)
+        return facts[:10]
 
     def _run_what_if_simulations(self, conscious_log: List[Dict[str, Any]]) -> None:
         """
@@ -2003,4 +2572,3 @@ if __name__ == "__main__":
         # of waiting for a clean teardown.
         import os as _os
         _os._exit(0)
-        
