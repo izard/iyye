@@ -25,11 +25,11 @@ HLD Goals:
 
 import json
 import re
-import threading
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 import logging
 
 from iyye_base import ProcessingStream
+from llm_scheduler import LLMCall, LLMConsumerMixin
 
 if TYPE_CHECKING:
     from main_loop import IyyeBrain
@@ -37,10 +37,14 @@ if TYPE_CHECKING:
 log = logging.getLogger("Iyye")
 
 
-class AlignmentStream(ProcessingStream):
+class AlignmentStream(LLMConsumerMixin, ProcessingStream):
     """
-    Iterates over processing streams and produces alignment scores via LLM,
-    with keyword-matching fallback when the LLM is unreachable.
+    Iterates over processing streams and produces alignment scores via the
+    async LLM scheduler (kind="alignment"), with keyword-matching fallback when
+    the LLM is unreachable.  The batch scoring call runs on a scheduler worker —
+    no bespoke background thread — and the scheduler's per-port priority keeps
+    it from contending with conscious chat (which made the old port-sharing
+    guard redundant).
     """
 
     GOALS = [
@@ -63,14 +67,9 @@ class AlignmentStream(ProcessingStream):
         self.priority = 0
         self._can_be_conscious = False
 
-        self._llm = None  # lazy-initialised
         self._tick_count = 0
         self._LLM_INTERVAL = 50  # only run LLM scoring every N ticks
         self._cached_results: Dict[str, Dict[str, float]] = {}
-        # Non-blocking LLM scoring: a background thread runs the batch call and
-        # writes results here when done; the main loop never waits for it.
-        self._pending_results: Optional[Dict[str, Dict[str, float]]] = None
-        self._score_thread: Optional[threading.Thread] = None
 
     # Never becomes conscious
     @property
@@ -85,80 +84,21 @@ class AlignmentStream(ProcessingStream):
     # LLM helper
     # ------------------------------------------------------------------
 
-    def _get_llm(self):
-        if self._llm is None:
-            router = getattr(getattr(self, 'brain', None), 'llm_router', None)
-            if router is not None:
-                self._llm = router.get_client(role="alignment", no_think=True, max_tokens=512)
-            else:
-                from llm_client import LLMClient
-                self._llm = LLMClient(no_think=True, max_tokens=512)
-        return self._llm
-
-    def _parse_scores(self, text: str) -> Optional[Dict[str, float]]:
-        """Extract a JSON scores dict from LLM output, tolerating extra text."""
-        # Strip markdown code fences if present
-        text = re.sub(r"```[a-z]*\n?", "", text).strip()
-        # Find the first {...} block
-        match = re.search(r"\{[^{}]+\}", text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            raw = json.loads(match.group())
-            scores = {}
-            for goal in self.GOALS:
-                val = raw.get(goal)
-                if isinstance(val, (int, float)):
-                    scores[goal] = float(max(0.0, min(1.0, val)))
-                else:
-                    scores[goal] = 0.0
-            return scores
-        except (json.JSONDecodeError, KeyError):
-            return None
-
     # ------------------------------------------------------------------
-    # execute — try batch LLM → per-stream LLM → keyword fallback
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Checkpoint-aware snapshotting
-    # ------------------------------------------------------------------
-
-    def _snapshot_candidates(self, candidates) -> list:
-        """Snapshot activity logs on the main thread while streams are paused.
-
-        HLD: alignment stream "stops each [stream] at checkpoint" before
-        checking activity logs.  In cooperative multitasking, streams are
-        between execute() calls here, so the pause is largely ceremonial
-        but ensures correctness if execution ever moves to concurrent threads.
-        """
-        snapshots = []
-        for s in candidates:
-            s.request_checkpoint_pause()
-            snapshots.append({
-                "name": s.name,
-                "activity_log": [str(e) for e in list(getattr(s, 'activity_log', []))[-20:]],
-                "output_history": [str(o) for o in list(getattr(s, 'output_history', []))[-5:]],
-            })
-            s.resume_from_checkpoint_pause()
-        return snapshots
-
-    # ------------------------------------------------------------------
-    # execute — try batch LLM → per-stream LLM → keyword fallback
+    # execute — async batch LLM (scheduler) → keyword fallback
     # ------------------------------------------------------------------
 
     def execute(self, context: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-        """Score all streams. Tries one batch LLM call first for efficiency.
-
-        LLM scoring is throttled to every _LLM_INTERVAL ticks to avoid blocking
-        the main loop for ~20s on every tick.  Between LLM ticks the cached
-        scores are used for known streams and keyword fallback for new ones.
+        """Score all streams.  A single batch LLM call (throttled to every
+        _LLM_INTERVAL ticks) is submitted to the async scheduler; between/while
+        it runs, cached scores are used for known streams and a keyword
+        fallback for new ones.  The call never blocks the main loop.
         """
         self._tick_count += 1
-        streams = context.get('streams', self.brain.streams)
+        # Inspect peers through the read-only view contract (immutable snapshots).
         candidates = [
-            s for s in streams
-            if not self._is_self(s) and not getattr(s, '_in_critical_section', False)
+            v for v in self.brain.stream_views()
+            if v.name != self.name and not v.in_critical_section
         ]
 
         # Cooperative checkpoint (never blocks — just checks stop flag).
@@ -167,121 +107,72 @@ class AlignmentStream(ProcessingStream):
         except StopIteration:
             return {}
 
-        # Collect completed background results if the thread just finished.
-        if self._pending_results is not None and (
-            self._score_thread is None or not self._score_thread.is_alive()
-        ):
-            self._cached_results.update(self._pending_results)
-            self._pending_results = None
-            self._score_thread = None
-            log.debug("AlignmentStream: background scoring results applied")
+        # Apply a finished batch scoring result.
+        result = self._llm_poll()
+        if result is not None and not result.discarded and result.ok and result.text:
+            parsed = self._parse_batch_scores(result.text)
+            if parsed:
+                self._cached_results.update(parsed)
+                log.debug("AlignmentStream: applied batch scores for %d streams",
+                          len(parsed))
 
-        # Throttle: only launch a new LLM thread every _LLM_INTERVAL ticks,
-        # and only if no thread is already in flight.
+        # Submit a new batch every _LLM_INTERVAL ticks when idle and not paused.
         if (
-            self._tick_count % self._LLM_INTERVAL == 1
-            and (self._score_thread is None or not self._score_thread.is_alive())
+            not self._paused
+            and not self._llm_busy()
+            and self._tick_count % self._LLM_INTERVAL == 1
         ):
-            # Guard: skip background LLM scoring when the alignment role would
-            # be routed to the same port as the top (conscious) model.  llama.cpp
-            # typically has a single inference slot; a long-running background
-            # alignment call would block that slot and cause 503 "Service
-            # Unavailable" for every other stream's request.
-            skip_llm = False
-            router = getattr(self.brain, 'llm_router', None)
-            if router is not None:
-                align_model = router.get_model_info("alignment")
-                top_model = router._find_top_model()
-                if (align_model is not None and top_model is not None
-                        and align_model["port"] == top_model["port"]):
-                    skip_llm = True
-                    log.debug(
-                        "AlignmentStream: skipping LLM scoring — alignment "
-                        "shares port %d with top model (slot contention)",
-                        align_model["port"],
-                    )
-                # Clear cached LLM client so routing changes are picked up
-                # when a dedicated alignment model becomes available later.
-                self._llm = None
-
-            if not skip_llm:
-                # HLD: "stopping each at checkpoint, and checking their activity
-                # log" — snapshot logs on the main thread while streams are paused
-                # between execute() calls.  The background LLM thread receives
-                # these immutable snapshots instead of live stream objects, which
-                # avoids reading mutable state from a concurrent thread.
-                log_snapshots = self._snapshot_candidates(candidates)
-
-                def _score_worker(snapshots=log_snapshots) -> None:
-                    result = self._batch_llm_score(snapshots)
-                    if result is not None:
-                        self._pending_results = result
-
-                self._score_thread = threading.Thread(
-                    target=_score_worker, name="alignment_llm", daemon=True
+            snapshots = [
+                {"name": v.name,
+                 "activity_log": list(v.recent_activity),
+                 "output_history": list(v.recent_outputs)}
+                for v in candidates
+            ]
+            if snapshots:
+                self._llm_submit(
+                    role="alignment", kind="alignment",
+                    call=LLMCall.from_file(
+                        "alignment_batch_streams",
+                        streams_snapshot=json.dumps(snapshots, indent=2),
+                    ),
+                    client_kwargs={"no_think": True, "max_tokens": 512},
                 )
-                self._score_thread.start()
-                log.debug("AlignmentStream: launched background scoring thread (%d stream snapshots)", len(log_snapshots))
 
-        # Always return from cached scores — never wait for the thread.
+        # Build the returned scores: cached batch scores + keyword fallback for
+        # any stream not yet covered by a batch result.
         results = dict(self._cached_results)
-
-        # Score any stream not yet covered by the batch result — always via
-        # keyword matching.  Per-stream LLM fallback was removed: if the batch
-        # call failed or was skipped, N × LLM calls would block the main loop
-        # for N × ~34s, which is worse than the batch call itself.
-        for stream in candidates:
-            if stream.name not in results:
-                results[stream.name] = self._keyword_scores(
-                    list(getattr(stream, 'activity_log', []))[-20:],
-                    list(getattr(stream, 'output_history', []))[-5:],
+        for v in candidates:
+            if v.name not in results:
+                results[v.name] = self._keyword_scores(
+                    list(v.recent_activity), list(v.recent_outputs),
                 )
-
-        # Persist results for non-LLM ticks.
         self._cached_results = dict(results)
 
-        for stream in candidates:
-            if stream.name in results:
-                stream.alignment_scores = results[stream.name]
-
+        # Apply scores through the brain (owner), not by mutating peers.
+        self.brain.record_alignment(results)
         return results
 
-    def _batch_llm_score(self, snapshots: list) -> Optional[Dict[str, Dict[str, float]]]:
-        """
-        Score all streams in a single LLM call using alignment_batch_streams prompt.
-
-        *snapshots* is a list of dicts ``{"name", "activity_log", "output_history"}``
-        built on the main thread by ``_snapshot_candidates`` so that this method
-        (which runs in a background thread) never touches live stream objects.
-
-        Returns None if LLM is unavailable or the response can't be parsed.
-        """
-        if not snapshots:
-            return {}
+    def _parse_batch_scores(self, raw: str) -> Optional[Dict[str, Dict[str, float]]]:
+        """Parse the batch LLM response ``{stream_name: {goal: score}}``."""
         try:
-            llm = self._get_llm()
-            response = llm.complete_from_file(
-                "alignment_batch_streams",
-                streams_snapshot=json.dumps(snapshots, indent=2),
-            )
-
-            # Parse outer dict {stream_name: {goal: score}}
-            text = re.sub(r"```[a-z]*\n?", "", response).strip()
-            raw = json.loads(text)
-
-            results = {}
-            for stream_name, score_map in raw.items():
+            text = re.sub(r"```[a-z]*\n?", "", raw).strip()
+            data = json.loads(text)
+            results: Dict[str, Dict[str, float]] = {}
+            for stream_name, score_map in data.items():
+                if not isinstance(score_map, dict):
+                    continue
                 scores = {}
                 for goal in self.GOALS:
                     val = score_map.get(goal, 0.0)
-                    scores[goal] = float(max(0.0, min(1.0, val)))
+                    try:
+                        scores[goal] = float(max(0.0, min(1.0, val)))
+                    except (TypeError, ValueError):
+                        scores[goal] = 0.0
                 results[stream_name] = scores
-
             log.debug("Batch LLM scored %d streams", len(results))
             return results
-
         except Exception as exc:
-            log.warning("Batch LLM alignment failed, falling back per-stream: %s", exc)
+            log.warning("AlignmentStream: batch score parse failed: %s", exc)
             return None
 
     # ------------------------------------------------------------------
@@ -321,7 +212,12 @@ class AlignmentStream(ProcessingStream):
             scores['social'] = min(0.9, 0.6 + n * 0.05)
 
         if outputs:
-            output_text = " ".join(str(o.get('data', '')) for o in outputs).lower()
+            # StreamView.recent_outputs are strings; older callers may pass
+            # {'data': ...} dicts — handle both.
+            output_text = " ".join(
+                str(o.get('data', '')) if isinstance(o, dict) else str(o)
+                for o in outputs
+            ).lower()
             if any(kw in output_text for kw in ['actuate', 'send', 'create', 'write', 'execute']):
                 scores['agency'] = min(scores['agency'] + 0.15, 0.9)
             if any(kw in output_text for kw in ['response', 'answer', 'hello', 'help', 'user']):
@@ -332,9 +228,6 @@ class AlignmentStream(ProcessingStream):
         return scores
 
     # ------------------------------------------------------------------
-
-    def _is_self(self, stream) -> bool:
-        return stream is self or (hasattr(stream, 'name') and stream.name == self.name)
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         super().restore_state(state)
