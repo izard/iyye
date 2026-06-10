@@ -53,6 +53,11 @@ class AdenosineStream(ProcessingStream):
         "llm_stop":             0.020,   # stopping an LLM (heavy)
         "stream_create":        0.010,   # creating a new processing stream
         "important_choice":     0.010,   # stream making a significant decision
+        # Long term plans (HLD: plan creation, replanning and step completion
+        # are important choices — also self-limits runaway planning loops).
+        "plan_create":          0.010,
+        "plan_replan":          0.010,
+        "plan_step_complete":   0.005,
     }
 
     def __init__(self, brain: "IyyeBrain"):
@@ -88,19 +93,20 @@ class AdenosineStream(ProcessingStream):
 
         HLD: "depletes during awake and triggers state transition to
         winding down state when approaches 0."
+
+        This stream is only ticked in the AWAKE state, so execute() only
+        handles passive awake depletion.  Sleep replenishment and the
+        on-wake refill are driven by the brain's sleep scheduler, which
+        calls this stream's owned ``replenish()`` / ``level`` API — the
+        stream owns the metric math, the scheduler owns *when*.  (The old
+        ASLEEP/WAKING_UP/WINDING_DOWN branches here were dead code, since
+        streams don't run in those states.)
         """
         from main_loop import MindState
 
         brain_state = getattr(self.brain, 'state', None)
-
         if brain_state == MindState.AWAKE:
             self._drain()
-        elif brain_state == MindState.ASLEEP:
-            self.replenish()
-        elif brain_state == MindState.WAKING_UP:
-            pass
-        elif brain_state == MindState.WINDING_DOWN:
-            pass
 
         return {
             'level': self._level,
