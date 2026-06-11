@@ -158,8 +158,7 @@ memory_db/ or memory_db.*   long-term memory storage
 
 ## Development Notes
 - Always activate `.venv` before running Python commands.
-- The worktree may contain generated stream files and generated deletions; review
-  them carefully before committing.
+- The worktree may contain generated stream files and generated deletions
 - Direct API use still exists in older built-in IO. MCP is more important for
   newly created IO/stream integrations than for all legacy/built-in modules.
 - Sleep behaves differently on first process start versus after a completed day:
