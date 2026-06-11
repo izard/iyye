@@ -1,5 +1,5 @@
 # Iyye
-Iyye is an experimental always-on personal assistant architecture focused on persistent memory, and hopefully emergence of a distinct local personality that develops differently in each installation.
+Iyye (home deity in Chuvash language) is an experimental always-on personal assistant architecture focused on persistent memory, and hopefully emergence of a distinct local personality that develops differently in each installation.
 It is vibecoded Python project including lightweight "brain" loop, short-term and long-term memory, sensor/actuator IO, and multiple
 cooperative processing streams.
 
