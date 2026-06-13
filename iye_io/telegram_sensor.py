@@ -31,6 +31,7 @@ Optional env:
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -91,10 +92,29 @@ class TelegramSensor(BaseSensorQueue):
                 except ValueError:
                     pass
 
-        # Persistent state: last seen update_id and default_chat_id
+        # At-least-once cursor (issue #3).  Telegram drops an update only once
+        # getUpdates is called with a higher offset, so the getUpdates offset
+        # is the durable "safe to drop" point — and it must advance ONLY after
+        # the brain has *processed* a message (via mark_processed), never at
+        # fetch or at queue-drain.  A crash before processing therefore leaves
+        # the message un-confirmed and Telegram re-delivers it on the next poll.
+        #   _confirmed_id  — persisted; getUpdates offset = _confirmed_id + 1.
+        #                    Highest update past which everything is processed.
+        #   _max_fetched   — highest update_id seen this session.
+        #   _inflight      — fetched + queued but not yet processed.
+        #   _processed     — processed (or filtered) but still above
+        #                    _confirmed_id because a lower update is still
+        #                    in-flight; used to dedup re-deliveries and to let
+        #                    _confirmed_id advance only past a contiguous
+        #                    processed prefix (so out-of-order acks never drop
+        #                    an unprocessed lower update).
         raw_state_path = Path(os.getenv("TELEGRAM_STATE_PATH", "telegram_sensor_state.json"))
         self._state_path = raw_state_path if raw_state_path.is_absolute() else PROJECT_ROOT / raw_state_path
-        self._last_update_id: int = 0
+        self._cursor_lock = threading.Lock()
+        self._confirmed_id: int = 0
+        self._max_fetched: int = 0
+        self._inflight: Set[int] = set()
+        self._processed: Set[int] = set()
         self._default_chat_id: Optional[int] = None
         self._load_state()
 
@@ -114,7 +134,9 @@ class TelegramSensor(BaseSensorQueue):
         try:
             if self._state_path.exists():
                 data = json.loads(self._state_path.read_text())
-                self._last_update_id = int(data.get("last_update_id", 0))
+                # Resume from the last CONFIRMED (processed) update.
+                self._confirmed_id = int(data.get("last_update_id", 0))
+                self._max_fetched = self._confirmed_id
                 chat = data.get("default_chat_id")
                 if chat is not None:
                     self._default_chat_id = int(chat)
@@ -122,12 +144,14 @@ class TelegramSensor(BaseSensorQueue):
             log.warning("Could not load Telegram sensor state: %s", exc)
 
     def _save_state(self) -> None:
+        # Persists the CONSUMED cursor (_confirmed_id), not the fetch offset —
+        # see the cursor-split note in __init__.
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             self._state_path.write_text(
                 json.dumps(
                     {
-                        "last_update_id": self._last_update_id,
+                        "last_update_id": self._confirmed_id,
                         "default_chat_id": self._default_chat_id,
                     }
                 )
@@ -150,7 +174,7 @@ class TelegramSensor(BaseSensorQueue):
             log.info(
                 "Telegram sensor started (interval=%.1fs, offset=%d)",
                 self.poll_interval,
-                self._last_update_id + 1,
+                self._confirmed_id + 1,
             )
 
     def stop_collection(self) -> None:
@@ -186,12 +210,14 @@ class TelegramSensor(BaseSensorQueue):
         """
         import requests
 
+        with self._cursor_lock:
+            offset = self._confirmed_id + 1
         url = _API_BASE.format(token=self._token, method="getUpdates")
         try:
             resp = requests.get(
                 url,
                 params={
-                    "offset": self._last_update_id + 1,
+                    "offset": offset,
                     "limit": 10,
                     "timeout": 0,
                     "allowed_updates": json.dumps(["message"]),
@@ -219,47 +245,81 @@ class TelegramSensor(BaseSensorQueue):
             return []
 
         out: List[Dict[str, Any]] = []
-        max_seen = self._last_update_id
+        with self._cursor_lock:
+            for upd in data.get("result", []):
+                uid = upd.get("update_id", 0)
+                # Skip re-deliveries: already processed (<= confirmed), already
+                # queued (in-flight), or already filtered/processed-pending.
+                if (uid <= self._confirmed_id or uid in self._inflight
+                        or uid in self._processed):
+                    continue
+                self._max_fetched = max(self._max_fetched, uid)
 
-        for upd in data.get("result", []):
-            uid = upd.get("update_id", 0)
-            max_seen = max(max_seen, uid)
+                msg = upd.get("message")
+                chat_id = (msg or {}).get("chat", {}).get("id")
+                # Filtered (non-message or disallowed chat): never queued, so it
+                # would never be mark_processed — confirm it directly so the
+                # offset can advance past it instead of re-delivering forever.
+                if not msg or (self._allowed and chat_id not in self._allowed):
+                    self._processed.add(uid)
+                    continue
 
-            msg = upd.get("message")
-            if not msg:
-                continue
+                user = msg.get("from") or {}
+                item: Dict[str, Any] = {
+                    "update_id": uid,
+                    "message_id": msg.get("message_id"),
+                    "chat_id": chat_id,
+                    "user_id": user.get("id"),
+                    "username": user.get("username"),
+                    "first_name": user.get("first_name"),
+                    "date_unix": msg.get("date"),
+                    "text": msg.get("text") or msg.get("caption") or "",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                out.append(item)
+                self._inflight.add(uid)
 
-            chat_id = msg.get("chat", {}).get("id")
-            if self._allowed and chat_id not in self._allowed:
-                continue
+                if self._default_chat_id is None and chat_id is not None:
+                    self._default_chat_id = chat_id
+                    log.info("Telegram sensor: learned default chat_id=%s", chat_id)
 
-            user = msg.get("from") or {}
-            text = msg.get("text") or msg.get("caption") or ""
-            date_unix = msg.get("date")
-
-            item: Dict[str, Any] = {
-                "update_id": uid,
-                "message_id": msg.get("message_id"),
-                "chat_id": chat_id,
-                "user_id": user.get("id"),
-                "username": user.get("username"),
-                "first_name": user.get("first_name"),
-                "date_unix": date_unix,
-                "text": text,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            out.append(item)
-
-            # Auto-learn default chat id from first seen message
-            if self._default_chat_id is None and chat_id is not None:
-                self._default_chat_id = chat_id
-                log.info("Telegram sensor: learned default chat_id=%s", chat_id)
-
-        if max_seen > self._last_update_id:
-            self._last_update_id = max_seen
-            self._save_state()
+            # Filtered updates may let the offset move forward immediately.
+            self._advance_confirmed_locked()
 
         return out
+
+    # ------------------------------------------------------------------
+    # Confirmation — advance the persisted cursor only after PROCESSING
+    # ------------------------------------------------------------------
+
+    def mark_processed(self, update_ids: List[int]) -> None:
+        """Confirm that the brain has fully handled *update_ids* (called by the
+        consuming stream after a reply is sent).  Only now may the durable
+        cursor advance past them so the next getUpdates lets Telegram drop them.
+
+        Out-of-order safe: the cursor advances only past a contiguous processed
+        prefix, so acking a higher update first never confirms (and thus drops)
+        a still-unprocessed lower one."""
+        with self._cursor_lock:
+            changed = False
+            for uid in update_ids:
+                if isinstance(uid, int) and uid in self._inflight:
+                    self._inflight.discard(uid)
+                    self._processed.add(uid)
+                    changed = True
+            if changed:
+                self._advance_confirmed_locked()
+
+    def _advance_confirmed_locked(self) -> None:
+        """Advance _confirmed_id as far as is safe — to one below the lowest
+        still-in-flight update, or to the highest fetched when nothing is in
+        flight.  Caller holds ``_cursor_lock``."""
+        new = (min(self._inflight) - 1) if self._inflight else self._max_fetched
+        if new > self._confirmed_id:
+            self._confirmed_id = new
+            # Drop now-confirmed ids from the pending set.
+            self._processed = {p for p in self._processed if p > self._confirmed_id}
+            self._save_state()
 
     # ------------------------------------------------------------------
     # Introspection
@@ -270,6 +330,8 @@ class TelegramSensor(BaseSensorQueue):
             "name": self.name,
             "running": self._running,
             "queue_size": len(self),
-            "last_update_id": self._last_update_id,
+            "last_update_id": self._confirmed_id,   # persisted resume point
+            "max_fetched": self._max_fetched,        # in-memory fetch position
+            "inflight": len(self._inflight),         # fetched, not yet processed
             "default_chat_id": self._default_chat_id,
         }
