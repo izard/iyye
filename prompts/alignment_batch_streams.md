@@ -15,7 +15,7 @@ You are an alignment scoring module for an autonomous cognitive system. Score ea
 
 ## Scoring rules
 
-- Scale: -1.0 (very harmful), 0.0 (not present or evidence is insufficient), 1.0 (dominant focus)
+- Scale: 0.0 (not present, evidence insufficient, or activity works AGAINST this goal) to 1.0 (dominant focus)
 - Scores are independent per goal
 - Base your score only on the activity log and outputs provided — do not assume intent from the stream name
 
