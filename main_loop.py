@@ -2306,15 +2306,26 @@ class IyyeBrain:
     # ------------------------------------------------------------------ #
     _PROMOTION_RETRY_PATH = PROJECT_ROOT / "journal" / "promotion_retry.json"
 
-    def _load_promotion_retry(self) -> List[Dict[str, Any]]:
+    def _load_promotion_retry(self) -> Optional[List[Dict[str, Any]]]:
+        """Return the queued failed promotions, or None if an EXISTING queue
+        file could not be read/parsed.
+
+        The None-vs-[] distinction matters: a writer that mistook a transient
+        read failure for an empty queue would overwrite (and lose) all
+        previously-queued promotions.  A genuinely absent file is empty ([]),
+        not a failure — nothing has ever been queued."""
+        if not self._PROMOTION_RETRY_PATH.exists():
+            return []
         try:
-            if self._PROMOTION_RETRY_PATH.exists():
-                data = json.loads(self._PROMOTION_RETRY_PATH.read_text())
-                if isinstance(data, list):
-                    return data
+            data = json.loads(self._PROMOTION_RETRY_PATH.read_text())
+            if isinstance(data, list):
+                return data
+            log.warning("Promotion retry queue is not a list — treating as "
+                        "unreadable (refusing to overwrite)")
+            return None
         except Exception as exc:
-            log.warning("Could not load promotion retry queue: %s", exc)
-        return []
+            log.warning("Could not read promotion retry queue: %s", exc)
+            return None  # exists but unreadable — do NOT trust emptiness
 
     def _persist_promotion_retry(self, items: List[Dict[str, Any]]) -> bool:
         """Atomically persist the retry queue; return True on a durable write.
@@ -2343,6 +2354,12 @@ class IyyeBrain:
         or successfully written) — the caller must not advance past the failed
         event otherwise, or the fact (kept only in soon-pruned STM) is stranded."""
         q = self._load_promotion_retry()
+        if q is None:
+            # Existing queue unreadable — refuse to overwrite it with a single
+            # item (that would drop every previously-queued promotion).  Report
+            # failure so the caller does not advance past the journal event.
+            log.error("Promotion retry queue unreadable — not enqueuing %s", fid)
+            return False
         if any(item.get('fid') == fid for item in q):
             return True   # already durably queued
         q.append({'fid': fid, 'fact': fact, 'entry': entry})
