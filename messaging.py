@@ -42,6 +42,8 @@ KNOWN_ACTIONS: Dict[str, Dict[str, Any]] = {
                          "required": ("stream_name", "usefulness")},
     "create_for_plan":  {"target": "stream_factory",
                          "required": ("plan", "plan_ref")},
+    "chat_follow_up":   {"target": "stream_factory",
+                         "required": ("stream_name", "text")},
     # → theory_of_mind
     "interaction":  {"target": "theory_of_mind", "required": ("contact_id",)},
     # → planner.  ``source`` on lifecycle messages is stamped by shipped code
@@ -177,6 +179,11 @@ class Messages:
     @staticmethod
     def create_for_plan(plan: Dict[str, Any], plan_ref: Dict[str, Any]) -> Message:
         return make_message("create_for_plan", plan=plan, plan_ref=plan_ref)
+
+    @staticmethod
+    def chat_follow_up(stream_name: str, text: str, contact: str = "") -> Message:
+        return make_message("chat_follow_up", stream_name=stream_name,
+                            text=text, contact=contact)
 
     @staticmethod
     def plan_propose(goal: str, source: str, steps=None, deadline=None,

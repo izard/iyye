@@ -33,6 +33,36 @@ existing stores; readers are introduced in later phases):
 * ``extracted``       {"activity_seq"}                       — key-fact extraction
                                                               ran for a stream_activity
 
+Causal-loop events (Phase 0 — shadow recording of the cognitive loop's
+non-deterministic inputs/outputs, the basis for the deterministic replay
+harness and the forensic flight recorder).  These are NOT yet consumed; they
+record so a recorded cycle can later be replayed/asserted:
+
+* ``tick``        {"tick","state","conscious"}              — one logical tick of the loop
+* ``llm_submit``  {"job_id","stream","kind","role",
+                   "conscious","prompt"}                    — an async LLM job was enqueued
+* ``llm_result``  {"job_id","stream","ok","error","model",
+                   "latency_s","discarded","text"}          — that job resolved (raw response)
+* ``tool_exec``   {"stream","kind","code","output"}         — a tool ran (e.g. python subprocess)
+* ``actuate``     {"actuator","payload"}                    — what actually reached an output device
+                                                              (post dedup/suppression guardrails)
+* ``lifecycle``   {"stream","old","new","reason"}           — a stream's declared liveness changed
+* ``recall``         {"query_id","query","n","sources",
+                      "refs"}                                — a unified memory recall ran; ``refs`` are the
+                                                              retrieved fact ids (the usefulness denominator)
+* ``recall_used``    {"query_id","refs","sources"}          — recalled facts that informed a response
+* ``recall_feedback``{"query_id","signal"}                  — next-turn implicit feedback (satisfied /
+                                                              dissatisfied) on a fact-using turn
+                                                              (recall/recall_used/recall_feedback join on
+                                                              query_id — the retrieval-quality signal #5 B/C
+                                                              folds into per-fact usefulness)
+* ``plan_review``  {"plan_id","lifecycle","candidate",
+                    "reasons","days_since_progress",...}     — a dreaming replan assessment of one plan
+* ``plan_revised``  {"plan_id","old_pending","new_pending",
+                    "escalated","lifecycle"}                 — dreaming replanned a plan's pending steps
+* ``plan_resolved`` {"plan_id","verdict","reason"}          — dreaming judged the goal achieved/moot
+                                                              (suspended for owner confirmation)
+
 Sleep replay is made restart-safe by these events rather than a saved cursor:
 on a cold start it rebuilds progress from ``stm_remove`` (every STM fact it
 already consumed) and ``extracted`` (every activity whose extraction already
@@ -46,16 +76,49 @@ scoring, LLM start/stop) may emit concurrently with the main loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from iyye_base import PROJECT_ROOT
 
 log = logging.getLogger("Iyye.Journal")
+
+# Recorded text fields (LLM responses, tool output) are bounded so a
+# pathological response can't bloat a partition.  Generous enough that normal
+# chat/codegen output is captured whole — replay fidelity wants the full text.
+_MAX_RECORDED_CHARS = 64_000
+
+
+def clip(text: Any, limit: int = _MAX_RECORDED_CHARS) -> str:
+    """Stringify and bound *text* for journaling, marking truncation."""
+    s = text if isinstance(text, str) else str(text)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"…[+{len(s) - limit} chars]"
+
+
+def fingerprint(text: Any) -> str:
+    """Short stable digest — identifies a prompt/script without storing it twice."""
+    s = text if isinstance(text, str) else str(text)
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def emit(journal: Optional["EventJournal"], event_type: str, **fields: Any) -> None:
+    """Best-effort shadow emit: no-op when *journal* is None; never raises.
+
+    The single guarded entry point every causal-event call site uses, so
+    instrumentation can never break the cognitive loop over a journal hiccup."""
+    if journal is None:
+        return
+    try:
+        journal.append(event_type, **fields)
+    except Exception:
+        pass
 
 
 class EventJournal:
@@ -149,12 +212,18 @@ class EventJournal:
     # Read (used by later phases; safe to call any time)
     # ------------------------------------------------------------------
 
-    def read_cycle(self, cycle_id: int) -> List[Dict[str, Any]]:
-        """Return all events for *cycle_id* in append order."""
+    def iter_cycle(self, cycle_id: int,
+                   types: Optional["frozenset"] = None) -> "Iterator[Dict[str, Any]]":
+        """Yield events for *cycle_id* in append order, one at a time.
+
+        Streams the partition file line by line rather than building the whole
+        list in memory.  When *types* is given, only events whose ``type`` is in
+        the set are yielded — so a consumer that only needs a few event kinds
+        (e.g. sleep replay, which ignores the high-volume ``sensor_input`` and
+        ``stm_merge`` events) never materializes the rest (issue #9)."""
         path = self._partition_path(cycle_id)
-        events: List[Dict[str, Any]] = []
         if not path.exists():
-            return events
+            return
         try:
             with path.open(encoding="utf-8") as fh:
                 for line in fh:
@@ -162,12 +231,19 @@ class EventJournal:
                     if not line:
                         continue
                     try:
-                        events.append(json.loads(line))
+                        ev = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if types is None or ev.get("type") in types:
+                        yield ev
         except OSError as exc:
             log.warning("Journal: could not read %s: %s", path, exc)
-        return events
+
+    def read_cycle(self, cycle_id: int,
+                   types: Optional["frozenset"] = None) -> List[Dict[str, Any]]:
+        """Return events for *cycle_id* in append order (optionally filtered to
+        *types*).  Convenience wrapper over :meth:`iter_cycle`."""
+        return list(self.iter_cycle(cycle_id, types=types))
 
     def cycle_ids(self) -> List[int]:
         """All cycle ids currently on disk, ascending."""
@@ -206,4 +282,4 @@ class EventJournal:
             self._close_fh()
 
 
-__all__ = ["EventJournal"]
+__all__ = ["EventJournal", "emit", "clip", "fingerprint"]

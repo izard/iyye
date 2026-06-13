@@ -47,12 +47,12 @@ SKIP_STREAM_NAMES = frozenset({
 
 # LLM-generated streams have dynamic names; match by prefix.
 SKIP_STREAM_PREFIXES = (
+    'llm_',             # codegen file names: llm_{safe_name}_{id}
     'llmsuggested',     # LlmsuggestedAgencystream3, etc.
-    'llm_suggested',    # llm_suggested_hardware_stream, etc.
     'llmexplore',       # LlmExploreSocialFollowUp, etc.
     'explore_',         # explore_social_followup_stream, etc.
     'suggested_',       # suggested_self_preservation_monitor, etc.
-    'plan_suggested',   # PlannedContinuationStream fallback streams
+    'plan_',            # PlannedContinuationStream (plan_suggested_*, plan_explore_*)
     'research_',        # WebResearchStream — result already sent to user
     'hardware_',        # hardware_suggestion_curiosity, etc.
 )

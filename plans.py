@@ -65,7 +65,19 @@ _TRANSITIONS: Dict[str, set] = {
 
 # Sources allowed to approve/activate an external-reaching plan.  Only the
 # local web chat (the machine owner) qualifies — same posture as trust.
-_OWNER_SOURCES = ("web_chat",)
+# Matched EXACTLY (see is_owner_source): a substring test would let a source
+# like "web_chat_telegram_bridge" or "evil_web_chat" pass the owner gate.
+_OWNER_SOURCES = frozenset({"web_chat"})
+
+
+def is_owner_source(source: str) -> bool:
+    """True only if *source* is exactly the local-owner channel.
+
+    The single definition of "owner" for plan lifecycle, used by both the
+    PlanStore gate and the planner's activation decision so they cannot
+    diverge.  Exact match, not substring — defence-in-depth on the trust
+    boundary (sources are code-stamped, but the gate must not be loose)."""
+    return (source or "").strip().lower() in _OWNER_SOURCES
 
 # Step types that reach beyond Iyye's own memory: they produce actions or
 # social output that may travel through non-local actuators.
@@ -106,6 +118,11 @@ class LongTermPlan:
         self.goal = goal
         # HLD alignment goals; lets AlignmentStream machinery score plan work.
         self.alignment_weights = alignment_weights or {"agency": 0.5}
+        # HLD: "Plan priority is recomputed by the alignment stream each
+        # cycle."  Never set by hand — AlignmentStream derives it from how
+        # underserved this plan's goals currently are (compute_priority), so
+        # plans stay subordinate to the motivation system.  0..1.
+        self.priority: float = 0.5
         self.steps = steps or []
         self.provenance = provenance
         self.deadline = deadline          # plan-level due date (ISO), optional
@@ -113,6 +130,14 @@ class LongTermPlan:
         self.created_at = _utcnow()
         self.lifecycle_changed_at = self.created_at
         self.last_progress_at: Optional[str] = None
+        # Journal cycle in which dreaming last revised this plan's steps —
+        # makes the revise pass idempotent across a sleep interruption/restart.
+        self.last_replanned_cycle: Optional[int] = None
+        # Review cadence (HLD: plans have a review cadence): dreaming reviews a
+        # plan at most this often.  Default 1 day → reviewed each dream but not
+        # twice in one real day; a slow plan can set a larger value.
+        self.review_cadence_days: float = 1.0
+        self.last_reviewed_at: Optional[str] = None
         self.progress: List[Dict[str, str]] = []   # [{ts, text}]
         for i, s in enumerate(self.steps):
             s.setdefault("step", i)
@@ -156,14 +181,23 @@ class LongTermPlan:
             s.get("status") == "done" for s in self.steps
         )
 
-    def next_due(self) -> Optional[str]:
-        """Earliest unmet deadline (ISO) across pending/dispatched steps and
-        the plan itself, or None."""
+    def next_due(self, statuses=("pending", "dispatched")) -> Optional[str]:
+        """Earliest unmet deadline (ISO) across steps in *statuses* and the
+        plan itself, or None.
+
+        Callers choose the lens: the default (pending + dispatched) answers
+        "is any of this plan's work time-constrained?" (sleep wakeup);
+        ``statuses=("pending",)`` answers "does the *planner* still have to
+        act?" — once a step is dispatched its deadline pressure belongs to
+        the executor stream, not the planner.
+        """
         candidates = [
             s.get("due") for s in self.steps
-            if s.get("status") in ("pending", "dispatched") and s.get("due")
+            if s.get("status") in statuses and s.get("due")
         ]
-        if self.deadline and not self.all_steps_done():
+        if self.deadline and any(
+            s.get("status") in statuses for s in self.steps
+        ):
             candidates.append(self.deadline)
         return min(candidates) if candidates else None
 
@@ -174,12 +208,31 @@ class LongTermPlan:
         )
         return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
+    def compute_priority(self, goal_needs: Dict[str, float]) -> float:
+        """Priority from the current motivation state: weights · goal needs.
+
+        *goal_needs* maps each alignment goal to how underserved it is right
+        now (0 = fully served by live streams, 1 = nothing serves it).  A plan
+        weighted toward underserved goals scores high; one whose goals are
+        already well covered scores low — the HLD's "subordinate to the
+        motivation system".  Weights are normalized so a plan can't outrank
+        others just by listing more goals.
+        """
+        total_w = sum(w for w in self.alignment_weights.values() if w > 0)
+        if total_w <= 0:
+            return 0.0
+        score = sum(
+            (w / total_w) * float(max(0.0, min(1.0, goal_needs.get(g, 0.5))))
+            for g, w in self.alignment_weights.items() if w > 0
+        )
+        return round(max(0.0, min(1.0, score)), 3)
+
     def summary_line(self) -> str:
         done = sum(1 for s in self.steps if s.get("status") == "done")
         due = self.next_due()
         return (
             f"[{self.lifecycle}] {self.plan_id}: {self.goal[:80]} "
-            f"({done}/{len(self.steps)} steps"
+            f"({done}/{len(self.steps)} steps, prio={self.priority:.2f}"
             + (f", due {due}" if due else "") + ")"
         )
 
@@ -192,6 +245,7 @@ class LongTermPlan:
             "plan_id": self.plan_id,
             "goal": self.goal,
             "alignment_weights": self.alignment_weights,
+            "priority": self.priority,
             "steps": self.steps,
             "provenance": self.provenance,
             "deadline": self.deadline,
@@ -199,6 +253,9 @@ class LongTermPlan:
             "created_at": self.created_at,
             "lifecycle_changed_at": self.lifecycle_changed_at,
             "last_progress_at": self.last_progress_at,
+            "last_replanned_cycle": self.last_replanned_cycle,
+            "review_cadence_days": self.review_cadence_days,
+            "last_reviewed_at": self.last_reviewed_at,
             "progress": self.progress[-200:],
         }
 
@@ -217,7 +274,17 @@ class LongTermPlan:
         plan.lifecycle_changed_at = d.get(
             "lifecycle_changed_at", plan.created_at)
         plan.last_progress_at = d.get("last_progress_at")
+        plan.last_replanned_cycle = d.get("last_replanned_cycle")
+        try:
+            plan.review_cadence_days = float(d.get("review_cadence_days", 1.0))
+        except (TypeError, ValueError):
+            plan.review_cadence_days = 1.0
+        plan.last_reviewed_at = d.get("last_reviewed_at")
         plan.progress = d.get("progress", [])
+        try:
+            plan.priority = float(d.get("priority", 0.5))
+        except (TypeError, ValueError):
+            plan.priority = 0.5
         return plan
 
 
@@ -251,7 +318,10 @@ class PlanStore:
         if self._plans:
             log.info("PlanStore: loaded %d plan(s)", len(self._plans))
 
-    def save(self, plan: LongTermPlan) -> None:
+    def save(self, plan: LongTermPlan) -> bool:
+        """Persist a plan atomically (tmp + replace).  Returns True on success,
+        False on failure — callers that mutate-then-save must check this and
+        not report a durable change that did not reach disk (P2-a)."""
         plan_dir = self.base_dir / plan.plan_id
         try:
             plan_dir.mkdir(parents=True, exist_ok=True)
@@ -261,8 +331,10 @@ class PlanStore:
                 encoding="utf-8",
             )
             tmp.replace(plan_dir / "plan.json")
+            return True
         except Exception as exc:
             log.error("Could not persist plan %s: %s", plan.plan_id, exc)
+            return False
 
     # ------------------------------------------------------------------
     # Creation
@@ -309,7 +381,11 @@ class PlanStore:
             plan_id = f"{base}_{n}"
         candidate.plan_id = plan_id
         self._plans[plan_id] = candidate
-        self.save(candidate)
+        if not self.save(candidate):
+            # Didn't reach disk — don't keep an in-memory plan that vanishes on
+            # restart (P2-a).
+            del self._plans[plan_id]
+            return None
         log.info("PlanStore: created plan %s (%s)", plan_id, candidate.lifecycle)
         return candidate
 
@@ -337,7 +413,7 @@ class PlanStore:
         if new_state not in _TRANSITIONS[plan.lifecycle]:
             return (f"illegal transition {plan.lifecycle} -> {new_state} "
                     f"for '{plan_id}'")
-        local = any(s in source.lower() for s in _OWNER_SOURCES)
+        local = is_owner_source(source)
         if new_state in ("approved", "active"):
             if plan.requires_owner_approval() and not local:
                 log.warning(
@@ -351,9 +427,15 @@ class PlanStore:
             # The planner itself may abandon (stale plans during sleep
             # review); remote chat contacts may not.
             return f"only the owner may abandon '{plan_id}'"
+        prev_state, prev_at = plan.lifecycle, plan.lifecycle_changed_at
         plan.lifecycle = new_state
         plan.lifecycle_changed_at = _utcnow()
-        self.save(plan)
+        if not self.save(plan):
+            # Persistence failed — roll back so in-memory state matches disk and
+            # report the failure rather than a transition that won't survive a
+            # restart (P2-a).
+            plan.lifecycle, plan.lifecycle_changed_at = prev_state, prev_at
+            return f"could not persist lifecycle change for '{plan_id}'"
         log.info("PlanStore: %s -> %s (source=%s)", plan_id, new_state, source)
         return None
 
@@ -373,16 +455,19 @@ class PlanStore:
     def by_lifecycle(self, state: str) -> List[LongTermPlan]:
         return [p for p in self._plans.values() if p.lifecycle == state]
 
-    def next_due_deadline(self) -> Optional[datetime]:
+    def next_due_deadline(
+        self, statuses=("pending", "dispatched"),
+    ) -> Optional[datetime]:
         """Earliest deadline across active plans — the in-sleep scheduler
         input (HLD: a due plan step is a valid urgent-wakeup source).
 
         Cheap (in-memory timestamp comparison), safe to call every asleep
-        tick while all streams are paused.
+        tick while all streams are paused.  *statuses* narrows which step
+        states count (see :meth:`LongTermPlan.next_due`).
         """
         earliest: Optional[datetime] = None
         for plan in self.active_plans():
-            due = plan.next_due()
+            due = plan.next_due(statuses=statuses)
             if not due:
                 continue
             try:
@@ -396,16 +481,60 @@ class PlanStore:
         return earliest
 
     # ------------------------------------------------------------------
+    # Priority (recomputed by AlignmentStream — HLD: plans subordinate to
+    # the motivation system, never a second competing source of goals)
+    # ------------------------------------------------------------------
+
+    def recompute_priorities(self, goal_needs: Dict[str, float]) -> int:
+        """Recompute priority for every non-terminal plan from the current
+        per-goal need levels.  Returns the number of plans whose priority
+        materially changed.  Persists only on material change (>= 0.05) so
+        the per-cycle call doesn't churn the disk.
+        """
+        changed = 0
+        for plan in self._plans.values():
+            if plan.lifecycle in ("completed", "abandoned"):
+                continue
+            new = plan.compute_priority(goal_needs)
+            if abs(new - plan.priority) >= 0.05:
+                plan.priority = new
+                self.save(plan)
+                changed += 1
+            else:
+                plan.priority = new  # keep in-memory value exact
+        return changed
+
+    # ------------------------------------------------------------------
     # Progress
     # ------------------------------------------------------------------
 
-    def record_progress(self, plan_id: str, text: str) -> None:
+    def record_progress(
+        self, plan_id: str, text: str,
+        confidence: float = 0.9, provenance: str = "planner",
+        time_frame: str = "dated",
+    ) -> None:
+        """Append a progress entry in the same tagged-fact shape as STM (HLD:
+        the progress log uses the STM fact format) — ts, confidence, provenance,
+        time_frame, text — so it reads and promotes uniformly with memory."""
         plan = self._plans.get(plan_id)
         if plan is None:
             return
         ts = _utcnow()
-        plan.progress.append({"ts": ts, "text": text[:500]})
+        plan.progress.append({
+            "ts": ts, "text": text[:500],
+            "confidence": round(float(confidence), 3),
+            "provenance": provenance,
+            "time_frame": time_frame,
+        })
         plan.last_progress_at = ts
+        self.save(plan)
+
+    def mark_reviewed(self, plan_id: str, ts: Optional[str] = None) -> None:
+        """Stamp a plan as reviewed this cadence-window (dreaming replanning)."""
+        plan = self._plans.get(plan_id)
+        if plan is None:
+            return
+        plan.last_reviewed_at = ts or _utcnow()
         self.save(plan)
 
     def mark_step(self, plan_id: str, step_index: int, status: str) -> bool:
@@ -414,10 +543,34 @@ class PlanStore:
             return False
         for s in plan.steps:
             if s.get("step") == step_index:
+                prev = s.get("status")
                 s["status"] = status
-                self.save(plan)
+                if not self.save(plan):
+                    s["status"] = prev   # roll back — change didn't persist
+                    return False
                 return True
         return False
+
+    def revise_pending_steps(
+        self, plan_id: str, new_pending: List[Dict[str, Any]],
+    ) -> Optional[LongTermPlan]:
+        """Replace a plan's pending (not-yet-done) steps with *new_pending*,
+        keeping the completed prefix untouched, and renumber.  Used by dreaming
+        replanning (Phase B): done steps are history, only the unfinished tail
+        is revisable.  Returns the plan, or None for an unknown plan / empty
+        revision (caller treats empty as 'keep')."""
+        plan = self._plans.get(plan_id)
+        if plan is None or not new_pending:
+            return None
+        steps = [s for s in plan.steps if s.get("status") == "done"]
+        for s in new_pending:
+            s.setdefault("status", "pending")
+            steps.append(s)
+        for i, s in enumerate(steps):
+            s["step"] = i
+        plan.steps = steps
+        self.save(plan)
+        return plan
 
     def replace_abstract_step(
         self, plan_id: str, step_index: int, concrete_steps: List[Dict[str, Any]],
@@ -469,4 +622,5 @@ class PlanStore:
         return plan
 
 
-__all__ = ["LongTermPlan", "PlanStore", "PLANS_ROOT", "LIFECYCLE_STATES"]
+__all__ = ["LongTermPlan", "PlanStore", "PLANS_ROOT", "LIFECYCLE_STATES",
+           "is_owner_source"]

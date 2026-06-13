@@ -24,11 +24,34 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
 log = logging.getLogger("Iyye")
+
+
+class StreamLifecycle(str, Enum):
+    """Declared liveness of a stream — the single contract every actor that
+    might reap or stop a stream reads, instead of each re-inferring "busy?"
+    from side effects (I/O counts, timing).  Subclass of str so it journals
+    and compares as a plain string.
+
+    - ``IDLE``     — no pending work item; safe to reap.
+    - ``ACTIVE``   — has unprocessed input/messages; working.
+    - ``AWAITING`` — blocked on an async result (LLM job or open multi-stage
+                     turn); reaping now orphans the result (the prune race).
+    - ``RETIRING`` — has asked to be removed; safe to reap.
+
+    The brain reconciles each stream's state once per tick from authoritative
+    signals (scheduler in-flight set, the stream's own bookkeeping) and emits
+    a ``lifecycle`` journal event on change — so the busy/idle decision is one
+    function, and the state timeline is in the replay tape (see replay.py)."""
+    IDLE = "idle"
+    ACTIVE = "active"
+    AWAITING = "awaiting"
+    RETIRING = "retiring"
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
@@ -84,6 +107,28 @@ class BaseSensorQueue(deque):
         return items
 
 
+class _Suppressed:
+    """Sentinel returned by :meth:`BaseActuator.actuate` when a guardrail
+    suppressed the payload (raw-data safety net or dedup).
+
+    Distinct from delivery (the concrete ``_do_actuate`` return, which may be
+    ``True`` or even ``None``) and from a known failure (``False``).  Callers
+    that care whether the user actually received the message must check
+    ``result is ACTUATE_SUPPRESSED`` — returning a bare ``None`` previously made
+    suppression indistinguishable from success, so a deduped/blocked reply was
+    logged as "Sent" while the user got nothing (issue #4)."""
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "<actuate-suppressed>"
+
+
+ACTUATE_SUPPRESSED = _Suppressed()
+
+
 class BaseActuator:
     """
     Very small contract for all output devices (actuators).
@@ -93,9 +138,15 @@ class BaseActuator:
     guardrails (dedup + raw-data suppression) before calling ``_do_actuate()``.
     ``send()`` is an alias for ``actuate()``.
 
+    When a guardrail suppresses a payload, ``actuate`` returns
+    :data:`ACTUATE_SUPPRESSED` (not ``None``) so callers can tell it apart from
+    delivery and report it honestly.
+
     Built-in dedup: identical messages are suppressed for ``_DEDUP_WINDOW``
-    seconds (default 120).  Subclasses can override the window or set it to 0
-    to disable.
+    seconds (default 120).  Pass ``allow_duplicate=True`` for messages that may
+    legitimately repeat (e.g. a chat reply to a repeated question) so they are
+    not silently dropped.  Subclasses can override the window or set it to 0 to
+    disable.  The raw-data safety net is never bypassable.
     """
 
     _DEDUP_WINDOW: float = 120.0  # seconds
@@ -113,41 +164,54 @@ class BaseActuator:
         """Deliver *payload* to the output device.  Subclasses **must** override."""
         raise NotImplementedError
 
-    def actuate(self, payload: str) -> Any:
-        """Send *payload* through guardrails (dedup + raw-data suppression),
+    def actuate(self, payload: str, allow_duplicate: bool = False) -> Any:
+        """Send *payload* through guardrails (raw-data suppression + dedup),
         then deliver via ``_do_actuate()``.
 
-        All callers — trusted streams, brain, LLM-generated code — get the
-        same protection automatically.
+        Returns the concrete actuator's delivery result, ``False`` on a known
+        delivery failure, or :data:`ACTUATE_SUPPRESSED` when a guardrail dropped
+        the payload.  Set *allow_duplicate* to skip the dedup window for
+        messages that may legitimately repeat (the raw-data net always applies).
         """
-        # Reject payloads that are clearly raw data dumps
+        # Reject payloads that are clearly raw data dumps (never bypassable).
         if self._RAW_DATA_MARKER.search(str(payload)):
             import logging
             logging.getLogger("Iyye").warning(
                 "Actuator %s: suppressed raw-data payload (%d chars)",
                 getattr(self, 'name', type(self).__name__), len(str(payload)),
             )
-            return None
+            return ACTUATE_SUPPRESSED
         now = time.monotonic()
         recent = getattr(self, '_recent_payloads', None)
         if recent is None:
             self._recent_payloads: dict[str, float] = {}
             recent = self._recent_payloads
         window = self._DEDUP_WINDOW
-        if window > 0:
+        if window > 0 and not allow_duplicate:
             last_sent = recent.get(payload)
             if last_sent is not None and now - last_sent < window:
-                return None  # suppressed duplicate
+                return ACTUATE_SUPPRESSED  # suppressed duplicate
         recent[payload] = now
         # Evict stale entries to bound memory
         if len(recent) > 200:
             cutoff = now - window
             self._recent_payloads = {k: v for k, v in recent.items() if v > cutoff}
+        # Shadow-journal what actually reaches the device (Phase 0 causal
+        # record): emitted here, past the raw-data and dedup guards, so the
+        # journal reflects real output — what replay asserts against.  The
+        # brain attaches ``journal`` to each actuator in _discover_io; lazy
+        # import avoids the iyye_base <-> event_journal cycle.
+        journal = getattr(self, 'journal', None)
+        if journal is not None:
+            from event_journal import emit, clip
+            emit(journal, "actuate",
+                 actuator=getattr(self, 'name', type(self).__name__),
+                 payload=clip(payload))
         return self._do_actuate(payload)
 
-    def send(self, payload: str) -> Any:
+    def send(self, payload: str, allow_duplicate: bool = False) -> Any:
         """Alias for :meth:`actuate` — kept for backward compatibility."""
-        return self.actuate(payload)
+        return self.actuate(payload, allow_duplicate=allow_duplicate)
 
     def is_safe_to_stop(self) -> bool:
         """Check if actuator can be safely stopped."""
@@ -192,6 +256,7 @@ class StreamView:
     is_generated: bool                # backed by an LLM-generated source file
     recent_activity: Tuple[str, ...]
     recent_outputs: Tuple[str, ...]
+    lifecycle: str = StreamLifecycle.IDLE  # declared liveness (Phase 2)
 
 
 class ProcessingStream(ABC):
@@ -227,6 +292,11 @@ class ProcessingStream(ABC):
         self._checkpoint_pause_requested: bool = False
         self.urgency: float = 0.0
         self._last_conscious_tick: int = 0  # Required for attention stream
+        # Declared liveness (Phase 2).  Maintained by the brain's per-tick
+        # reconciler; read via brain.is_reapable().  _retiring is the stream's
+        # own request to be removed (set by request_retire()).
+        self.lifecycle: StreamLifecycle = StreamLifecycle.IDLE
+        self._retiring: bool = False
         # HLD: "all subconscious streams pause" during winding-down.  Streams
         # that spawn background threads (alignment LLM scoring, LLM start/stop
         # subprocesses) must NOT launch new work while paused, and must drain
@@ -248,6 +318,32 @@ class ProcessingStream(ABC):
     def request_stop(self) -> None:
         """Request stream to stop at next safe point."""
         self._stop_requested = True
+
+    def request_retire(self, reason: str = "") -> None:
+        """Declare intent to be removed (Phase 2).  A self-retiring stream
+        calls this before dropping itself from ``brain.streams`` so the
+        RETIRING transition is journaled — the observable record that the
+        removal was the stream's own decision, not a reap."""
+        self._retiring = True
+        self.transition(StreamLifecycle.RETIRING, reason or "self-retire")
+
+    def transition(self, state: "StreamLifecycle", reason: str = "") -> None:
+        """Set declared lifecycle and journal the change (no-op if unchanged).
+
+        Called by the brain's reconciler (and request_retire); best-effort
+        journaling via the brain's event journal, so a missing journal never
+        breaks the loop."""
+        if state == self.lifecycle:
+            return
+        old, self.lifecycle = self.lifecycle, state
+        brain = getattr(self, 'brain', None)
+        journal = getattr(brain, 'journal', None) if brain is not None else None
+        if journal is not None:
+            from event_journal import emit
+            # Pass the members (str subclass) so JSON records the clean value
+            # ("idle"/"awaiting"), not Enum's "StreamLifecycle.IDLE" repr.
+            emit(journal, 'lifecycle', stream=self.name,
+                 old=old.value, new=state.value, reason=reason)
 
     def can_stop_safely(self) -> bool:
         """Return True if the stream can be stopped externally right now.
@@ -482,6 +578,7 @@ class ProcessingStream(ABC):
                 str(o.get('data', '') if isinstance(o, dict) else o)
                 for o in (getattr(self, 'output_history', []) or [])[-5:]
             ),
+            lifecycle=getattr(self, 'lifecycle', StreamLifecycle.IDLE).value,
         )
 
     def get_state(self) -> Dict[str, Any]:
@@ -502,5 +599,5 @@ class ProcessingStream(ABC):
         self._state = state.get("state", {})
 
 
-__all__ = ['PROJECT_ROOT', 'BaseSensorQueue', 'BaseActuator', 'ProcessingStream',
-           'StreamView', 'SleepPhase']
+__all__ = ['PROJECT_ROOT', 'BaseSensorQueue', 'BaseActuator', 'ACTUATE_SUPPRESSED',
+           'ProcessingStream', 'StreamView', 'SleepPhase', 'StreamLifecycle']

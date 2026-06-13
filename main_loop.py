@@ -346,6 +346,10 @@ class IyyeBrain:
         self.journal = EventJournal()
         self._journal_cycle: int = int(self._load_iyye_state().get("journal_cycle", 0))
         self.journal.start_cycle(self._journal_cycle)
+        # Actuators are discovered before the journal exists; backfill the
+        # handle so BaseActuator.actuate can shadow-record output (Phase 0).
+        for _act in self.actuators.values():
+            _act.journal = self.journal
 
         # ------------------------------------------------------------------- #
         # Short-term memory (structured fact store, in-memory + daily JSONL)
@@ -356,8 +360,13 @@ class IyyeBrain:
         # (Phase 3 — STM is a projection of the journal; JSONL is a cache).
         self.stm.journal = self.journal
         try:
+            # STM is a fold over only the stm_* events — skip sensor_input etc.
+            # so reconciliation doesn't materialize the whole partition (#9).
             self.stm.reconcile_with_journal(
-                self.journal.read_cycle(self._journal_cycle)
+                self.journal.read_cycle(
+                    self._journal_cycle,
+                    types=frozenset({'stm_fact', 'stm_merge', 'stm_remove'}),
+                )
             )
         except Exception as exc:
             log.warning("STM journal reconciliation failed: %s", exc)
@@ -369,6 +378,15 @@ class IyyeBrain:
         # ------------------------------------------------------------------- #
         from plans import PlanStore
         self.plan_store = PlanStore()
+        # The plan deadline this brain last woke up for.  A given overdue
+        # deadline interrupts sleep ONCE; until the store's earliest deadline
+        # changes (the due step completed, or a different deadline became
+        # due), later sleeps proceed normally.  Without this, an overdue
+        # deadline that can't be cleared quickly (LLM down, abstract step)
+        # re-fires the wakeup gate every asleep tick — before replay (order
+        # 70) ever runs — starving dreaming, day advancement and the full
+        # adenosine refill forever.
+        self._plan_deadline_wake_fired: Optional[datetime] = None
 
         # ------------------------------------------------------------------- #
         # Processing streams – loaded dynamically.
@@ -559,6 +577,9 @@ class IyyeBrain:
                         elif issubclass(obj, BaseActuator) and obj is not BaseActuator:
                             instance = obj()
                             key = getattr(instance, 'name', obj_name)
+                            # Attach the journal so BaseActuator.actuate can
+                            # shadow-record real output (Phase 0 causal record).
+                            instance.journal = getattr(self, 'journal', None)
                             self.actuators[key] = instance
                             log.info("Loaded actuator %s from %s", key, fname)
 
@@ -717,6 +738,13 @@ class IyyeBrain:
             self._tick_counter,
             self.state.name,
         )
+        # Shadow-journal the tick boundary (Phase 0): the replay clock and the
+        # frame every other causal event is positioned within.
+        from event_journal import emit
+        conscious = getattr(self, '_current_conscious', None)
+        emit(getattr(self, 'journal', None), 'tick',
+             tick=self._tick_counter, state=self.state.name,
+             conscious=(conscious.name if conscious is not None else None))
 
         # ------------------------------------------------------------------- #
         # Gather sensor payloads (each returns a list of raw data items)
@@ -738,6 +766,15 @@ class IyyeBrain:
                 if journal is not None:
                     for item in stamped:
                         journal.append('sensor_input', sensor=name, payload=item)
+                # NOTE: a cursor-based sensor (Telegram) is NOT acknowledged
+                # here.  Journaling alone is not recoverable — nothing replays
+                # sensor_input on restart — so acking after journaling could
+                # still lose a message that crashes before it is processed.
+                # The acknowledgment happens only once the consumer (the chat
+                # stream) has actually processed the message
+                # (UserChatStream -> sensor.mark_processed), with Telegram
+                # itself acting as the durable inbox (it re-delivers anything
+                # not yet acked).
 
         # ------------------------------------------------------------------- #
         # Dispatch based on current state
@@ -790,12 +827,20 @@ class IyyeBrain:
             self._start_subconscious_streams()
             self._subconscious_started = True
             log.info("Started subconscious streams")
-            # Ensure LLM is healthy before any stream can make a request.
+            # Kick LLM readiness off the waking path: even the health-probe +
+            # port-seeding does HTTP probes that can take seconds, and the cold
+            # start is now async — run the whole thing on a daemon thread so
+            # waking stays "very short" (P2-b).  The loop tolerates the LLM not
+            # being ready on the first awake tick (scheduler model_unavailable +
+            # chat retry + the health-check loop).
             llm_mgmt = next(
                 (s for s in self.streams if s.name == 'llm_management'), None
             )
             if llm_mgmt is not None:
-                llm_mgmt.ensure_running()
+                threading.Thread(
+                    target=llm_mgmt.ensure_running,
+                    name="llm_ensure_running", daemon=True,
+                ).start()
             # Do not return
         
         # HLD: "selects conscious stream to be either one reflecting over high priority
@@ -926,6 +971,11 @@ class IyyeBrain:
         self._apply_attention_result(subconscious_results)
         self._maybe_wind_down()
 
+        # Reconcile declared liveness from this tick's end state and journal
+        # any transitions (Phase 2): one place computes busy/idle, and the
+        # per-stream state timeline lands in the replay tape.
+        self.reconcile_lifecycles()
+
         return [conscious_result] if conscious_result is not None else subconscious_results
 
     # ---- awake phase helpers ----------------------------------------- #
@@ -976,6 +1026,78 @@ class IyyeBrain:
             if s.name == name:
                 return s.to_view()
         return None
+
+    # ------------------------------------------------------------------ #
+    # Stream liveness contract (Phase 2): one declared state, one predicate,
+    # read by every actor that might reap or stop a stream — instead of each
+    # re-inferring "busy?" from side effects.  See StreamLifecycle, replay.py.
+    # ------------------------------------------------------------------ #
+
+    # Special/infrastructure streams that must NEVER be reaped, regardless of
+    # apparent idleness.  The single canonical set (the factory and brain
+    # previously kept two that had drifted — 'planner' was in neither, so the
+    # pruner could reap it after ~50 ticks).
+    _NEVER_REAP = frozenset({
+        'attention_stream', 'alignment_stream', 'stream_factory',
+        'self_reflection', 'adenosine_stream', 'stm_update',
+        'llm_management', 'theory_of_mind', 'planner',
+    })
+
+    def stream_busy_state(self, stream) -> "StreamLifecycle":
+        """Compute a stream's effective liveness from authoritative signals.
+
+        AWAITING wins: an in-flight scheduler job or an open multi-stage turn
+        means an async result is outstanding and reaping would orphan it — the
+        prune-while-rephrase race.  Then RETIRING (self-requested), then ACTIVE
+        (unprocessed messages or inputs awaiting an output), else IDLE."""
+        from iyye_base import StreamLifecycle
+        sched = getattr(self, 'llm_scheduler', None)
+        if getattr(stream, '_turn', None):
+            return StreamLifecycle.AWAITING
+        if sched is not None:
+            try:
+                if sched.has_inflight(stream.name):
+                    return StreamLifecycle.AWAITING
+            except Exception:
+                pass
+        if getattr(stream, '_retiring', False):
+            return StreamLifecycle.RETIRING
+        if len(getattr(stream, '_pending_messages', []) or []):
+            return StreamLifecycle.ACTIVE
+        inputs = len(getattr(stream, 'input_history', []) or [])
+        outputs = len(getattr(stream, 'output_history', []) or [])
+        if inputs > outputs:
+            return StreamLifecycle.ACTIVE
+        return StreamLifecycle.IDLE
+
+    def is_reapable(self, stream) -> bool:
+        """Single safety predicate: may this stream be removed/stopped right
+        now without losing work?  The contract that replaces the four
+        per-actor inferences.  Does NOT decide *whether* to reap (that is the
+        factory's policy) — only whether it is *safe* to."""
+        from iyye_base import StreamLifecycle
+        if stream is getattr(self, '_current_conscious', None):
+            return False
+        if stream.name in self._NEVER_REAP:
+            return False
+        if getattr(stream, '_in_critical_section', False):
+            return False
+        return self.stream_busy_state(stream) in (
+            StreamLifecycle.IDLE, StreamLifecycle.RETIRING,
+        )
+
+    def reconcile_lifecycles(self) -> None:
+        """Recompute every stream's declared lifecycle and journal changes.
+
+        Run once per awake tick so the busy/idle decision is made in one place
+        and the per-stream state timeline lands in the replay tape.  Reaping
+        safety reads live signals via is_reapable(); this maintains the
+        observable record."""
+        for stream in list(self.streams):
+            try:
+                stream.transition(self.stream_busy_state(stream), reason="reconcile")
+            except Exception as exc:
+                log.debug("reconcile_lifecycles: %s failed: %s", stream.name, exc)
 
     def theory_of_mind(self):
         """Stable accessor for the Theory-of-Mind stream (or None if not yet
@@ -1677,12 +1799,21 @@ class IyyeBrain:
         # Long term plan deadlines — the scheduler input (HLD: a deadline on
         # an active plan step is a valid urgent-wakeup source, same mechanism
         # as a high priority sensor input).  Cheap in-memory timestamp check.
+        # Each distinct deadline fires at most once (_plan_deadline_wake_fired)
+        # so a deadline that stays overdue across an awake cycle cannot put
+        # the brain in a sleep→instant-wake loop that starves dreaming.
         try:
             due = self.plan_store.next_due_deadline()
             if due is not None and due <= datetime.now(timezone.utc):
-                self._wakeup_reason = f"plan step due at {due.isoformat()}"
-                log.info("Wakeup triggered by long term plan deadline")
-                return True
+                if due != self._plan_deadline_wake_fired:
+                    self._plan_deadline_wake_fired = due
+                    self._wakeup_reason = f"plan step due at {due.isoformat()}"
+                    log.info("Wakeup triggered by long term plan deadline")
+                    return True
+                log.debug(
+                    "Plan deadline %s already woke this brain once — "
+                    "letting sleep housekeeping proceed", due.isoformat(),
+                )
         except Exception as exc:
             log.warning("Plan deadline wakeup check failed: %s", exc)
 
@@ -1760,6 +1891,16 @@ class IyyeBrain:
     # decisions; the *work* of each phase is owned by a stream/producer.
     _SLEEP_WAKEUP_GATE_ORDER = 50
     _REPLAY_BATCH = 3  # LLM extraction calls per replay tick
+    # Event types sleep replay reads (everything else — sensor_input, stm_merge
+    # — is high-volume noise replay ignores; filtering them keeps the replay
+    # working set bounded, issue #9):
+    #   stream_activity — key-fact extraction source + alignment for what-if
+    #   stm_fact        — STM facts to promote to LTM
+    #   stm_remove / ltm_promotion / extracted — idempotency markers re-seeded
+    #                     on a cold restart so work isn't repeated
+    _REPLAY_EVENT_TYPES = frozenset({
+        'stream_activity', 'stm_fact', 'stm_remove', 'ltm_promotion', 'extracted',
+    })
 
     def _sleep_core_phases(self) -> List["SleepPhase"]:
         from iyye_base import SleepPhase
@@ -2089,8 +2230,13 @@ class IyyeBrain:
         ticks and across an interrupted wakeup."""
         cid = getattr(self, '_journal_cycle', 0)
         journal = getattr(self, 'journal', None)
+        # Stream the partition but materialize ONLY the event types replay
+        # actually uses — sensor_input (camera/hardware/telegram volume) and
+        # stm_merge are skipped, so the working set is bounded by cognitive
+        # activity, not sensor noise (issue #9).
         self._jreplay_events: List[Dict[str, Any]] = (
-            journal.read_cycle(cid) if journal is not None else []
+            journal.read_cycle(cid, types=self._REPLAY_EVENT_TYPES)
+            if journal is not None else []
         )
         # fact_id -> activity event; activity index -> [paired fact texts]
         self._jreplay_fact_activity: Dict[str, Dict[str, Any]] = {}
@@ -2197,7 +2343,6 @@ class IyyeBrain:
             if etype == 'stm_fact':
                 fid = e.get('fact_id')
                 if fid and fid not in self._jreplay_promoted:
-                    self._jreplay_promoted.add(fid)
                     fact = live_by_id.get(fid) or {
                         'id': fid,
                         'text': e.get('text', ''),
@@ -2210,18 +2355,29 @@ class IyyeBrain:
                         {'stream': paired.get('stream'), 'timestamp': paired.get('ts')}
                         if paired else None
                     )
-                    ltm_id = self._promote_stm_to_ltm(fact, entry)
-                    if ltm_id:
-                        self._jreplay_discovered.append(
-                            {'id': ltm_id, 'text': fact.get('text', '')}
-                        )
-                        if getattr(self, 'journal', None) is not None:
-                            self.journal.append(
-                                'ltm_promotion', ltm_id=ltm_id,
-                                fact_id=fid, src_seq=e.get('seq'),
-                                text=fact.get('text', '')[:200],
+                    result = self._promote_stm_to_ltm(fact, entry)
+                    if result is None:
+                        # Transient LTM failure — keep the STM fact (do NOT add
+                        # to step_removed) and leave it unmarked so a restart or
+                        # later pass retries it.  Never delete the only copy of a
+                        # fact whose promotion failed (HLD: promote then delete).
+                        log.warning("Replay: promotion failed for %s — keeping "
+                                    "STM fact for retry", fid)
+                    else:
+                        # Promoted (id) or intentionally filtered — either way the
+                        # STM copy is now safe to delete.
+                        self._jreplay_promoted.add(fid)
+                        if result != self._PROMOTE_FILTERED:
+                            self._jreplay_discovered.append(
+                                {'id': result, 'text': fact.get('text', '')}
                             )
-                    step_removed.append(fid)
+                            if getattr(self, 'journal', None) is not None:
+                                self.journal.append(
+                                    'ltm_promotion', ltm_id=result,
+                                    fact_id=fid, src_seq=e.get('seq'),
+                                    text=fact.get('text', '')[:200],
+                                )
+                        step_removed.append(fid)
 
             elif etype == 'stream_activity':
                 seq = e.get('seq')
@@ -2243,28 +2399,38 @@ class IyyeBrain:
                     key_facts = self._extract_key_facts(
                         clean, stream_name=stream_name, paired_facts=paired_facts,
                     )
-                    # Mark extraction done BEFORE writing the facts to LTM.  The
-                    # LLM call above has no LTM side effects, so a crash during
-                    # it simply re-extracts harmlessly; but a crash *mid-store*
-                    # must not repeat the whole extraction on restart (that would
-                    # duplicate facts in LTM).  Marking first makes extraction
-                    # at-most-once: a partial store may drop a few re-derivable
-                    # facts, which is preferable to duplicating them.
-                    self._jreplay_extracted.add(seq)
-                    if getattr(self, 'journal', None) is not None:
-                        self.journal.append('extracted', activity_seq=seq)
                     for kf in key_facts:
-                        if _EPHEMERAL_METRIC_RE.search(kf) or _LTM_NOISE_RE.search(kf):
+                        kf_text = kf.get('text', '')
+                        if (_EPHEMERAL_METRIC_RE.search(kf_text)
+                                or _LTM_NOISE_RE.search(kf_text)):
+                            continue
+                        # Per-fact tags from extraction (HLD: LTM fact format
+                        # is the same tagged format as STM).  Ephemeral facts
+                        # never belong in LTM.
+                        if kf.get('time_frame') == 'ephemeral':
                             continue
                         sid = self.memory.store_fact(
-                            text=kf, confidence=0.7, source=stream_name,
+                            text=kf_text,
+                            confidence=kf.get('confidence', 0.7),
+                            source=stream_name,
                             provenance=(
                                 f"Extracted during sleep replay from "
                                 f"'{stream_name}' at {e.get('ts')}"
                             ),
-                            time_frame='permanent',
+                            time_frame=kf.get('time_frame', 'permanent'),
                         )
-                        self._jreplay_discovered.append({'id': sid, 'text': kf})
+                        self._jreplay_discovered.append(
+                            {'id': sid, 'text': kf_text})
+                    # Mark extraction done AFTER the facts are durable
+                    # (at-least-once).  A crash mid-store leaves the activity
+                    # unmarked, so restart re-extracts and re-stores — and LTM's
+                    # semantic dedup in store_fact makes the re-store idempotent
+                    # (no duplicates).  This is safer than marking-first
+                    # (at-most-once), which permanently dropped facts whose store
+                    # was interrupted (P1-d).
+                    self._jreplay_extracted.add(seq)
+                    if getattr(self, 'journal', None) is not None:
+                        self.journal.append('extracted', activity_seq=seq)
 
             cursor += 1
 
@@ -2297,6 +2463,11 @@ class IyyeBrain:
             except AttributeError:
                 pass
 
+    # Sentinel distinguishing "intentionally not promoted, safe to delete from
+    # STM" from a transient store failure (None) which must NOT delete the only
+    # surviving copy (P1-b: failed promotion was deleting the STM fact).
+    _PROMOTE_FILTERED = "__filtered__"
+
     def _promote_stm_to_ltm(
         self,
         stm_fact: Dict[str, Any],
@@ -2304,7 +2475,9 @@ class IyyeBrain:
     ) -> Optional[str]:
         """
         Write a single STM fact into long-term memory, preserving all HLD tags.
-        Returns the LTM fact id on success, None on failure.
+        Returns the LTM fact id on success, ``_PROMOTE_FILTERED`` when the fact
+        is intentionally not promoted (safe to delete from STM), or None on a
+        transient store failure (caller must KEEP the STM fact and retry).
         Ephemeral and session facts are never promoted (ephemeral = transient
         metrics; session = relevant only to the current wakeup cycle).
         Content matching noise patterns (LLM placeholders, system status,
@@ -2313,10 +2486,10 @@ class IyyeBrain:
         their internal bookkeeping is not durable knowledge about the world.
         """
         if stm_fact.get('time_frame') in ('ephemeral', 'session'):
-            return None
+            return self._PROMOTE_FILTERED
         text = stm_fact.get('text', '')
         if _EPHEMERAL_METRIC_RE.search(text) or _LTM_NOISE_RE.search(text):
-            return None
+            return self._PROMOTE_FILTERED
         # Reject facts from LLM-generated / planned streams.  Their output
         # is internal recommendations or operational noise, never durable
         # knowledge about the world — regardless of whether the attention
@@ -2326,7 +2499,7 @@ class IyyeBrain:
             prov_lower = prov.lower()
             if (any(prov_lower.startswith(p) for p in _REPLAY_SKIP_PREFIXES)
                     or any(kw in prov_lower for kw in _REPLAY_SKIP_KEYWORDS)):
-                return None
+                return self._PROMOTE_FILTERED
         try:
             provenance = "Promoted from STM during sleep replay"
             if entry:
@@ -2373,10 +2546,15 @@ class IyyeBrain:
         text: str,
         stream_name: str = "unknown",
         paired_facts: Optional[List[str]] = None,
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
         Extract key facts from conscious stream text using LLM.
         Falls back to heuristic extraction if the LLM is unreachable.
+
+        Returns tagged fact dicts (``text``/``confidence``/``time_frame``) —
+        HLD: LTM fact format is the same tagged format as STM, so dreaming
+        must carry per-fact tags rather than storing every extraction with
+        one hardcoded confidence/time_frame.
 
         ``paired_facts`` are STM facts that the replay pairing step
         associated with this log entry — used as additional context per
@@ -2404,14 +2582,17 @@ class IyyeBrain:
 
         # Heuristic fallback — reached when the router/LLM is unavailable or the
         # extraction call raised.  Lower quality; the warnings above make the
-        # degradation visible rather than silent.
+        # degradation visible rather than silent.  Conservative default tags:
+        # keyword-matched sentences are uncertain (0.5) and not provably
+        # durable, so 'recent' rather than 'permanent'.
         facts = []
         for sentence in text.replace('!', '.').replace('?', '.').split('.'):
             s = sentence.strip()
             if 20 < len(s) < 200:
                 if any(kw in s.lower() for kw in ['learned', 'discovered', 'found',
                                                    'determined', 'concluded', 'noted']):
-                    facts.append(s)
+                    facts.append({'text': s, 'confidence': 0.5,
+                                  'time_frame': 'recent'})
         return facts[:5]
 
     def _get_replay_extraction_client(self):
@@ -2445,28 +2626,55 @@ class IyyeBrain:
                         "LLMClient (%s) — using heuristic extraction", exc)
             return None
 
-    def _parse_extracted_facts(self, response: str, stream_name: str) -> List[str]:
-        """Filter raw LLM extraction output into clean fact lines."""
-        facts: List[str] = []
+    def _parse_extracted_facts(
+        self, response: str, stream_name: str,
+    ) -> List[Dict[str, Any]]:
+        """Parse LLM extraction output into tagged fact dicts.
+
+        Primary format is one JSON object per line (text/confidence/
+        time_frame — see prompts/extract_facts.md); a non-JSON line that
+        passes the noise filters is kept as a plain-text fact with
+        conservative default tags, so a model that ignores the JSON
+        instruction degrades gracefully instead of losing the fact.
+        """
+        from iyye_io.short_term_memory import TIME_FRAMES
+        facts: List[Dict[str, Any]] = []
         for line in response.splitlines():
-            line = line.strip()
+            line = line.strip().strip('`')
             if not line:
                 continue
-            # Skip lines that are clearly LLM reasoning artefacts
-            if _LTM_NOISE_RE.search(line):
+            text, confidence, time_frame = line, 0.7, 'permanent'
+            if line.startswith('{'):
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue  # malformed JSON line — not salvageable as text
+                if not isinstance(obj, dict) or not obj.get('text'):
+                    continue
+                text = str(obj['text']).strip()
+                try:
+                    confidence = max(0.2, min(1.0, float(obj.get('confidence', 0.7))))
+                except (TypeError, ValueError):
+                    confidence = 0.7
+                tf = str(obj.get('time_frame', '')).strip().lower()
+                if tf in TIME_FRAMES:
+                    time_frame = tf
+            # Noise filters apply to the fact text in either format.
+            if _LTM_NOISE_RE.search(text):
                 continue
-            if _EPHEMERAL_METRIC_RE.search(line):
+            if _EPHEMERAL_METRIC_RE.search(text):
                 continue
             # Skip HTML / thinking tags
-            if line.startswith('<') and '>' in line:
+            if text.startswith('<') and '>' in text:
                 continue
             # Skip markdown headings and horizontal rules
-            if line.startswith('#') or line == '---':
+            if text.startswith('#') or text == '---':
                 continue
             # Skip very short lines (likely fragments)
-            if len(line) < 10:
+            if len(text) < 10:
                 continue
-            facts.append(line)
+            facts.append({'text': text, 'confidence': confidence,
+                          'time_frame': time_frame})
         log.debug("LLM extracted %d facts from %s", len(facts), stream_name)
         return facts[:10]
 
@@ -2572,3 +2780,5 @@ if __name__ == "__main__":
         # of waiting for a clean teardown.
         import os as _os
         _os._exit(0)
+
+
