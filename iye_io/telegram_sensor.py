@@ -143,21 +143,27 @@ class TelegramSensor(BaseSensorQueue):
         except Exception as exc:
             log.warning("Could not load Telegram sensor state: %s", exc)
 
-    def _save_state(self) -> None:
-        # Persists the CONSUMED cursor (_confirmed_id), not the fetch offset —
-        # see the cursor-split note in __init__.
+    def _save_state(self, confirmed_id: int) -> bool:
+        """Atomically persist *confirmed_id* (tmp + rename).  Returns True on a
+        durable write, False on failure.  The caller must NOT expose a cursor
+        it could not persist — confirming an update at Telegram is irreversible
+        (issue: cursor exposed before persistence)."""
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(
+            tmp = self._state_path.with_name(self._state_path.name + ".tmp")
+            tmp.write_text(
                 json.dumps(
                     {
-                        "last_update_id": self._confirmed_id,
+                        "last_update_id": confirmed_id,
                         "default_chat_id": self._default_chat_id,
                     }
                 )
             )
+            tmp.replace(self._state_path)   # atomic
+            return True
         except Exception as exc:
             log.warning("Could not save Telegram sensor state: %s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -313,13 +319,21 @@ class TelegramSensor(BaseSensorQueue):
     def _advance_confirmed_locked(self) -> None:
         """Advance _confirmed_id as far as is safe — to one below the lowest
         still-in-flight update, or to the highest fetched when nothing is in
-        flight.  Caller holds ``_cursor_lock``."""
+        flight.  Caller holds ``_cursor_lock``.
+
+        Persist the candidate cursor BEFORE assigning it: the getUpdates offset
+        derives from _confirmed_id, so the next poll would tell Telegram to drop
+        these updates.  If the durable write fails we must NOT advance — leave
+        _confirmed_id unchanged so Telegram re-delivers and we retry next time
+        (otherwise a swallowed save loses the messages permanently)."""
         new = (min(self._inflight) - 1) if self._inflight else self._max_fetched
-        if new > self._confirmed_id:
-            self._confirmed_id = new
-            # Drop now-confirmed ids from the pending set.
-            self._processed = {p for p in self._processed if p > self._confirmed_id}
-            self._save_state()
+        if new <= self._confirmed_id:
+            return
+        if not self._save_state(new):
+            return  # not durable — keep the old cursor; Telegram re-delivers
+        self._confirmed_id = new
+        # Drop now-confirmed ids from the pending set.
+        self._processed = {p for p in self._processed if p > self._confirmed_id}
 
     # ------------------------------------------------------------------
     # Introspection
