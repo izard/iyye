@@ -57,9 +57,9 @@ class AttentionStream(ProcessingStream):
         HLD: "looks at what are all processing streams doing at the moment
         and decides which one is the most important and/or urgent."
         """
-        streams = context.get('streams', self.brain.streams)
-
-        if not streams:
+        # Inspect peers through the read-only view contract, never raw objects.
+        views = self.brain.stream_views()
+        if not views:
             return None
 
         # Cooldown to prevent excessive swapping
@@ -75,117 +75,89 @@ class AttentionStream(ProcessingStream):
         )
 
         scored = []
-        for stream in streams:
-            if self._is_self(stream):
+        for view in views:
+            if view.name == self.name:
                 continue
-            if not getattr(stream, '_can_be_conscious', True):
+            if not view.can_be_conscious:
                 continue
-            # Skip streams in critical section
-            if getattr(stream, '_in_critical_section', False):
-                log.debug("Skipping %s (in critical section)", stream.name)
+            if view.in_critical_section:
+                log.debug("Skipping %s (in critical section)", view.name)
                 continue
-
-            score = self._calculate_importance(stream, context)
-            scored.append((stream, score))
+            scored.append((view, self._calculate_importance(view)))
 
         if not scored:
             return None
 
         scored.sort(key=lambda x: x[1], reverse=True)
+        top_view, top_score = scored[0]
 
-        current_conscious = context.get('current_conscious')
-        top_stream, top_score = scored[0]
+        # Identify the current conscious stream by view, not object identity.
+        current_view = next((v for v in views if v.is_conscious), None)
 
-        # Only promote if significantly more important or current is None
         should_promote = False
-        if current_conscious is None:
+        if current_view is None:
             should_promote = True
-        elif current_conscious != top_stream:
-            # Check if current stream is in critical section
-            if getattr(current_conscious, '_in_critical_section', False):
-                self.add_to_log(f"Waiting for {current_conscious.name} to exit critical section")
+        elif current_view.name != top_view.name:
+            if current_view.in_critical_section:
+                self.add_to_log(f"Waiting for {current_view.name} to exit critical section")
                 return None
-
-            # Score the current conscious stream to compare directly.
-            current_score = self._calculate_importance(current_conscious, context)
-
+            current_score = self._calculate_importance(current_view)
             # Promote if the contender meaningfully outscores the incumbent,
-            # or if the contender has pending user messages (always urgent).
-            has_pending = len(getattr(top_stream, '_pending_messages', [])) > 0
-            if top_score > current_score + 0.1 or has_pending:
+            # or if it has pending user messages (always urgent).
+            if top_score > current_score + 0.1 or top_view.pending > 0:
                 should_promote = True
 
         if should_promote:
-            self.add_to_log(f"Promoting {top_stream.name} (score={top_score:.2f})")
+            self.add_to_log(f"Promoting {top_view.name} (score={top_score:.2f})")
             self._swap_cooldown = 2
             self._last_top_score = top_score
-
+            # Return the NAME to promote; the brain resolves it to the live
+            # stream.  Attention no longer hands out raw stream objects.
             return {
-                'promote': top_stream,
-                'demote': current_conscious,
-                'reason': f"score={top_score:.2f}"
+                'promote': top_view.name,
+                'demote': current_view.name if current_view else None,
+                'reason': f"score={top_score:.2f}",
             }
 
         return None
 
-    def _is_self(self, stream) -> bool:
-        """Check if stream is self."""
-        return stream is self or (hasattr(stream, 'name') and stream.name == self.name)
-
-    def _calculate_importance(self, stream, context: Dict[str, Any]) -> float:
+    def _calculate_importance(self, view) -> float:
         """
-        Calculate importance score for a stream.
+        Calculate importance score for a stream view.
 
-        Factors:
-        - Base priority (30%)
-        - Pending inputs (30%)
-        - Alignment to goals (25%)
-        - Urgency (15%)
-        - Time since last conscious (bonus)
+        Factors: base priority (30%), pending work (30%), alignment (25%),
+        urgency (15%), recency bonus, and a curiosity bonus.
         """
         score = 0.0
 
         # Base priority weight (30%)
-        priority = getattr(stream, 'priority', 1)
-        score += (min(priority, 10) / 10.0) * 0.3
+        score += (min(view.priority, 10) / 10.0) * 0.3
 
         # Pending user messages — direct user input always gets high priority.
-        # _pending_messages is set by UserChatStream for unprocessed messages.
-        pending_msgs = len(getattr(stream, '_pending_messages', []))
-        if pending_msgs > 0:
-            score += min(pending_msgs * 0.5, 0.5)
-        else:
-            # For planned streams use unexecuted steps as the pending-work proxy.
-            # Continuous streams (subconscious, LLM-generated) don't use
-            # input/output pairing, so they get no pending-work bonus —
-            # otherwise the input-output gap grows forever and inflates priority.
-            plan_steps = getattr(stream, '_plan_steps', None)
-            if plan_steps is not None:
-                remaining = len(plan_steps) - getattr(stream, '_current_step', 0)
-                score += min(max(remaining, 0) * 0.1, 0.3)
+        if view.pending > 0:
+            score += min(view.pending * 0.5, 0.5)
+        elif view.plan_remaining is not None:
+            # Planned streams use unexecuted steps as the pending-work proxy.
+            # Continuous (subconscious/generated) streams have plan_remaining
+            # None, so they get no pending-work bonus.
+            score += min(max(view.plan_remaining, 0) * 0.1, 0.3)
 
-        # Alignment to goals (25%) - HLD: alignment scores from alignment_stream
-        alignment = getattr(stream, 'alignment_scores', {})
-        if alignment:
-            avg_alignment = sum(alignment.values()) / len(alignment)
-            score += avg_alignment * 0.25
+        # Alignment to goals (25%)
+        if view.alignment_scores:
+            avg = sum(view.alignment_scores.values()) / len(view.alignment_scores)
+            score += avg * 0.25
 
-        # Urgency (15%) - NEW: from stream.urgency attribute
-        urgency = getattr(stream, 'urgency', 0.0)
-        score += min(urgency, 1.0) * 0.15
+        # Urgency (15%)
+        score += min(view.urgency, 1.0) * 0.15
 
         # Bonus for streams that haven't had conscious time recently
-        last_conscious = getattr(stream, '_last_conscious_tick', 0)
         current_tick = getattr(self.brain, '_tick_counter', 0)
-        if last_conscious == 0 or current_tick - last_conscious > 50:
+        if view.last_conscious_tick == 0 or current_tick - view.last_conscious_tick > 50:
             score += 0.1
 
-        # NEW: Bonus for streams with recent high-value outputs
-        outputs = getattr(stream, 'output_history', [])
-        if outputs:
-            recent = outputs[-3:]
-            if any('fact' in str(o.get('data', '')).lower() for o in recent):
-                score += 0.05  # Curiosity bonus
+        # Curiosity bonus for recent fact-bearing outputs
+        if any('fact' in o.lower() for o in view.recent_outputs):
+            score += 0.05
 
         return min(score, 1.0)
 

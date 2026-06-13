@@ -19,7 +19,9 @@ Self-Reflection Stream - Monitors self position and system resources.
 """
 
 import os
+import re
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 
 try:
@@ -34,7 +36,9 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-from iyye_base import ProcessingStream
+from iyye_base import ProcessingStream, SleepPhase
+from llm_scheduler import LLMCall, LLMConsumerMixin
+from memory_filters import should_skip_stream as _should_skip_provenance
 
 if TYPE_CHECKING:
     from main_loop import IyyeBrain
@@ -42,10 +46,13 @@ if TYPE_CHECKING:
 log = logging.getLogger("Iyye")
 
 
-class SelfReflectionStream(ProcessingStream):
+class SelfReflectionStream(LLMConsumerMixin, ProcessingStream):
     """
     Monitors system state and self-awareness.
     Can be promoted to conscious (unlike other special streams).
+
+    The conscious introspective report is generated through the async
+    scheduler so producing it never blocks the main loop.
     """
 
     def __init__(self, brain: "IyyeBrain"):
@@ -140,13 +147,22 @@ class SelfReflectionStream(ProcessingStream):
             self.urgency = 0.9
             self.add_to_log("CRITICAL: CPU usage above 95%")
         elif state['llm']['status'] == 'unreachable':
-            self.priority = 7
-            self.urgency = 0.6
-            self.add_to_log("WARNING: LLM server unreachable")
-            self.brain.post_message("llm_management", {
-                "action": "restart", "role": "chat",
-                "reason": "self_reflection: LLM unreachable",
-            })
+            # Consult the authoritative health owner (llm_management) rather
+            # than acting on this bare snapshot: if a restart is already in
+            # flight, observe and wait — re-requesting one per tick is the
+            # restart flapping.  Only escalate when truly down-and-unattended.
+            if self._chat_llm_state() == "restoring":
+                self.priority = 5
+                self.urgency = 0.3
+                self.add_to_log("LLM restarting (handled by llm_management)")
+            else:
+                self.priority = 7
+                self.urgency = 0.6
+                self.add_to_log("WARNING: LLM server unreachable")
+                from messaging import Messages
+                self.brain.post_message("llm_management", Messages.restart_llm(
+                    role="chat", reason="self_reflection: LLM unreachable",
+                ))
         elif state['adenosine_level'] < 0.2:
             self.priority = 8
             self.urgency = 0.7
@@ -177,9 +193,9 @@ class SelfReflectionStream(ProcessingStream):
                 state, context.get('sensors_data', {}),
             )
 
-        # When conscious: produce and store an introspective report.
-        if self.is_conscious:
-            self._produce_conscious_report(state)
+        # Async conscious introspective report: apply a finished one, and —
+        # when conscious, due, and idle — submit a new one (never blocks).
+        self._pump_conscious_report(state)
 
         return state
 
@@ -188,94 +204,88 @@ class SelfReflectionStream(ProcessingStream):
     # markdown file.")
     # ------------------------------------------------------------------
 
+    def perform_system_check(self) -> Dict[str, Any]:
+        """Run the asleep system-check and (re)publish system_description.md.
+
+        HLD assigns the system description to this stream; the brain's sleep
+        scheduler calls this hook so the *content* is owned here rather than in
+        the orchestrator.  Delegates to the single producer in
+        ``system_description`` (shared with the brain's first-sleep bootstrap)."""
+        from system_description import run_system_check
+        return run_system_check(self.brain)
+
     def _update_system_description(self, state: Dict[str, Any]) -> None:
-        """Build system_description.md in memory; write to disk once per day."""
-        from iyye_base import PROJECT_ROOT
+        """Translate gathered state into canonical shape and publish.
 
-        iyye_day = state.get('iyye_day', 0)
+        Rendering, cache update, and on-disk write are all handled by
+        :func:`system_description.publish_system_description` so the brain's
+        sleep-time writer and this awake-time writer cannot diverge.  Disk
+        write is content-deduplicated by the publisher — the old once-per-day
+        throttle is no longer needed.
+        """
+        from system_description import publish_system_description
 
-        # --- Build markdown from gathered state ---
-        ts = state.get('timestamp', '')
-
-        hw_lines = (
-            f"| CPU      | {state.get('cpu_percent', 0):.1f}% |\n"
-            f"| Memory   | {state.get('memory_percent', 0):.1f}% |\n"
-            f"| Disk     | {state.get('disk_percent', 0):.1f}% |"
-        )
-
-        sensors_md = "\n".join(
-            f"- **{s['name']}**: queue={s['queue_size']}, "
-            f"healthy={s['healthy']}"
-            for s in state.get('io_health', {}).get('sensors', [])
-        ) or "_(none)_"
-
-        actuators_md = "\n".join(
-            f"- **{a['name']}**: reachable={a['reachable']}"
-            for a in state.get('io_health', {}).get('actuators', [])
-        ) or "_(none)_"
-
-        llm_info = state.get('llm', {})
-        llm_lines = []
-        for m in llm_info.get('models', []):
-            tag = "UP" if m.get('healthy') else "DOWN"
-            roles = ", ".join(m.get('roles', [])) or "-"
-            llm_lines.append(
-                f"- **{m['name']}** [{tag}] {m.get('size_gb', 0)}GB "
-                f"roles=[{roles}]"
-            )
-        llm_md = "\n".join(llm_lines) or "_(unreachable)_"
-
-        streams_meta = state.get('streams_meta', [])
-        streams_md = "\n".join(
-            f"- **{s['name']}** (priority={s['priority']}, "
-            f"pending={s['pending']}"
-            + (", conscious" if s['is_conscious'] else "")
-            + ")"
+        streams_meta = state.get('streams_meta', []) or []
+        canonical_streams = [
+            {'name': s.get('name'), 'priority': s.get('priority', 0),
+             'is_conscious': bool(s.get('is_conscious')),
+             'pending': s.get('pending')}
             for s in streams_meta
-        ) or "_(none)_"
-
+        ]
         conscious_name = next(
-            (s['name'] for s in streams_meta if s['is_conscious']),
-            "_(none)_",
+            (s['name'] for s in streams_meta if s.get('is_conscious')),
+            None,
         )
+
+        io_health = state.get('io_health') or {}
+        canonical_sensors = [
+            {'name': s['name'], 'queue_size': s.get('queue_size', 0),
+             'healthy': s.get('healthy')}
+            for s in io_health.get('sensors', [])
+        ]
+        canonical_actuators = [
+            {'name': a['name'], 'reachable': a.get('reachable')}
+            for a in io_health.get('actuators', [])
+        ]
+
+        llm_info = state.get('llm') or {}
+        canonical_llms: Optional[list] = [
+            {'name':    m.get('name', '?'),
+             'healthy': bool(m.get('healthy', False)),
+             'size_gb': m.get('size_gb', 0),
+             'roles':   m.get('roles', []) or []}
+            for m in llm_info.get('models', [])
+        ]
+        # Empty list = "unreachable"; None signal stays reserved for "no
+        # information at all" (e.g. brain reading a missing llm-active.json).
 
         pos = state.get('position', {})
-        facts_count = pos.get('facts_in_memory', 0)
+        adenosine_max = 1.0
+        if hasattr(self.brain, 'adenosine') and hasattr(self.brain.adenosine, 'MAX'):
+            adenosine_max = self.brain.adenosine.MAX
 
-        md = (
-            f"# Iyye System Description\n"
-            f"_Generated: {ts} UTC — Iyye day {iyye_day}_\n\n"
-            f"## Hardware\n"
-            f"| Resource | Usage |\n"
-            f"|----------|-------|\n"
-            f"{hw_lines}\n\n"
-            f"## Sensors\n{sensors_md}\n\n"
-            f"## Actuators\n{actuators_md}\n\n"
-            f"## LLMs\n{llm_md}\n\n"
-            f"## Execution Streams\n"
-            f"Active: {len(streams_meta)}  |  Conscious: {conscious_name}\n\n"
-            f"{streams_md}\n\n"
-            f"## Long-term Memory\n"
-            f"Stored facts: {facts_count}\n\n"
-            f"## Adenosine\n"
-            f"Level: {state.get('adenosine_level', 0):.3f}\n"
-        )
-
-        # Always update in-memory cache for other streams.
-        try:
-            self.brain._system_description_md = md
-        except Exception:
-            pass
-
-        # Write to disk at most once per iyye_day.
-        if iyye_day != self._last_description_day:
-            md_path = PROJECT_ROOT / "system_description.md"
-            try:
-                md_path.write_text(md, encoding="utf-8")
-                self._last_description_day = iyye_day
-                log.info("Updated system_description.md (day %d)", iyye_day)
-            except Exception as exc:
-                log.warning("Failed to write system_description.md: %s", exc)
+        canonical = {
+            'timestamp':        state.get('timestamp'),
+            'iyye_day':         state.get('iyye_day'),
+            'hardware': {
+                'cpu_percent':    state.get('cpu_percent', 0),
+                'memory_percent': state.get('memory_percent', 0),
+                'disk_percent':   state.get('disk_percent', 0),
+            },
+            'sensors':          canonical_sensors,
+            'actuators':        canonical_actuators,
+            'llms':             canonical_llms,
+            'streams':          canonical_streams,
+            'conscious_stream': conscious_name,
+            'memory_facts':     pos.get('facts_in_memory', 0),
+            'adenosine':        state.get('adenosine_level', 0.0),
+            'adenosine_max':    adenosine_max,
+        }
+        publish_system_description(self.brain, canonical)
+        # Track day for the existing _last_description_day consumers (logging
+        # cadence elsewhere).  Disk-write dedup is handled by the publisher,
+        # so this no longer gates writes.
+        self._last_description_day = state.get('iyye_day', self._last_description_day)
 
     # Substrings identifying chat/user-facing sensors (same heuristic as StreamFactory).
     _CHAT_KEYWORDS = ('chat', 'telegram', 'microphone', 'whisper', 'message')
@@ -296,8 +306,11 @@ class SelfReflectionStream(ProcessingStream):
     def _find_goal_evidence(self, goal: str) -> List[Dict[str, Any]]:
         """Search STM for concrete facts that justify creating a goal stream.
 
-        Returns up to 3 recent, non-ephemeral facts.  Returns [] when
-        nothing concrete is found, which suppresses stream creation.
+        Returns up to 3 recent, non-ephemeral facts whose provenance is a
+        first-party stream (not an LLM-generated or planned stream).
+        Returns [] when nothing concrete is found, which suppresses stream
+        creation and prevents a self-reinforcing loop where generated-stream
+        output becomes evidence for creating more generated streams.
         """
         stm = getattr(self.brain, 'stm', None)
         if stm is None:
@@ -309,8 +322,17 @@ class SelfReflectionStream(ProcessingStream):
                 results.extend(stm.search(q, limit=3))
             except Exception:
                 pass
-        # Keep only recent, non-ephemeral/non-session facts.
+        # Keep only recent, non-ephemeral/non-session facts from
+        # first-party streams.  Facts from generated/planned streams are
+        # excluded to prevent a feedback loop where generated output
+        # seeds new goal suggestions.
         recent_ids = {f.get('id') for f in stm.get_recent(50)}
+        # Collect names of codegen streams (have _source_file) whose
+        # LLM-chosen name might not match standard skip patterns.
+        codegen_names = {
+            s.name for s in getattr(self.brain, 'streams', [])
+            if getattr(s, '_source_file', None)
+        }
         seen: set = set()
         unique: List[Dict[str, Any]] = []
         for r in results:
@@ -319,6 +341,9 @@ class SelfReflectionStream(ProcessingStream):
             if rid in seen or tf in ('ephemeral', 'session'):
                 continue
             if rid not in recent_ids:
+                continue
+            prov = r.get('provenance', '')
+            if prov and (_should_skip_provenance(prov) or prov in codegen_names):
                 continue
             seen.add(rid)
             unique.append(r)
@@ -370,24 +395,24 @@ class SelfReflectionStream(ProcessingStream):
             if key in self._suggest_cooldown:
                 continue
             self._suggest_cooldown[key] = tick
-            self.brain.post_message("stream_factory", {
-                "action": "suggest_stream",
-                "reason": (f"Sensor '{sensor_name}' has {len(payloads)} unprocessed "
-                           f"item(s) with no handling stream"),
-                "sensor": sensor_name,
-                "goal": "curiosity",
-            })
+            from messaging import Messages
+            self.brain.post_message("stream_factory", Messages.suggest_stream(
+                reason=(f"Sensor '{sensor_name}' has {len(payloads)} unprocessed "
+                        f"item(s) with no handling stream"),
+                sensor=sensor_name,
+                goal="curiosity",
+            ))
             self.add_to_log(
                 f"Flagged stream creation: sensor '{sensor_name}' "
                 f"({len(payloads)} items, no handler)"
             )
 
         # 2. Alignment goal gap: no stream scores above threshold on a goal.
+        # Read peer alignment through the view contract, not raw objects.
         goal_max: Dict[str, float] = {g: 0.0 for g in self._GOALS}
-        for s in streams:
-            scores = getattr(s, 'alignment_scores', {})
+        for v in self.brain.stream_views():
             for g in self._GOALS:
-                val = scores.get(g, 0.0)
+                val = v.alignment_scores.get(g, 0.0)
                 if val > goal_max[g]:
                     goal_max[g] = val
 
@@ -403,36 +428,246 @@ class SelfReflectionStream(ProcessingStream):
             if not evidence:
                 continue
             self._suggest_cooldown[key] = tick
-            self.brain.post_message("stream_factory", {
-                "action": "suggest_stream",
-                "reason": (f"Goal '{goal}' underserved (best={best:.2f}), "
-                           f"evidence: {evidence[0].get('text', '')[:80]}"),
-                "goal": goal,
-                "sensor": None,
-                "evidence_ids": [e.get('id', '') for e in evidence if e.get('id')],
-                "evidence_texts": [e['text'][:200] for e in evidence],
-            })
+            from messaging import Messages
+            self.brain.post_message("stream_factory", Messages.suggest_stream(
+                reason=(f"Goal '{goal}' underserved (best={best:.2f}), "
+                        f"evidence: {evidence[0].get('text', '')[:80]}"),
+                goal=goal,
+                sensor=None,
+                evidence_ids=[e.get('id', '') for e in evidence if e.get('id')],
+                evidence_texts=[e['text'][:200] for e in evidence],
+            ))
             self.add_to_log(
                 f"Flagged stream creation: goal '{goal}' underserved "
                 f"(best={best:.2f}, {len(evidence)} evidence facts)"
             )
+            # A goal that stays underserved across several suggestion rounds
+            # is a recurring desire, not a one-tick gap — escalate it to a
+            # long term plan (HLD: planner creates plans from self-reflection
+            # coverage gaps).  The planner dedups repeat proposals by
+            # fingerprint, so over-firing here is harmless.
+            counts = getattr(self, '_goal_gap_counts', None)
+            if counts is None:
+                counts = self._goal_gap_counts = {}
+            counts[goal] = counts.get(goal, 0) + 1
+            if counts[goal] >= 3:
+                counts[goal] = 0
+                self.brain.post_message("planner", Messages.plan_propose(
+                    goal=(f"Persistently address underserved goal "
+                          f"'{goal}': {evidence[0].get('text', '')[:120]}"),
+                    source="self_reflection",
+                    alignment_weights={goal: 1.0},
+                ))
+                self.add_to_log(
+                    f"Escalated recurring goal gap '{goal}' to a long term "
+                    f"plan proposal"
+                )
 
-    def _produce_conscious_report(self, state: Dict[str, Any]) -> None:
+        # 3. Promise gap (HLD: coverage gaps include "promises with no
+        #    matching delivery").  Promise/delivery facts use the canonical
+        #    phrasing convention from stm_extract_facts.md.
+        self._flag_unfulfilled_promises(tick)
+
+    # Give an in-flight turn time to deliver on its own before nagging —
+    # a promise is only "unkept" once it has aged past normal turn latency.
+    _PROMISE_MIN_AGE_S = 600
+
+    def _flag_unfulfilled_promises(self, tick: int) -> None:
+        """Match today's "Iyye promised X: ..." STM facts against
+        "Iyye delivered to X: ..." facts; an aged unmatched promise becomes a
+        chat follow-up routed via the factory back into the conversation the
+        promise was made in (its stream name travels as fact provenance).
         """
-        Generate a first-person introspective summary via LLM and store
-        key findings in long-term memory.  Called only when this stream
-        is the conscious stream.
-        """
+        stm = getattr(self.brain, 'stm', None)
+        if stm is None:
+            return
+        try:
+            facts = stm.get_all_today()
+        except Exception as exc:
+            log.debug("Promise sweep: STM read failed: %s", exc)
+            return
+        promises: List[Dict[str, Any]] = []
+        deliveries: List[Dict[str, Any]] = []
+        for f in facts:
+            t = (f.get('text') or '').strip().lower()
+            if t.startswith('iyye promised'):
+                promises.append(f)
+            elif t.startswith('iyye delivered to'):
+                deliveries.append(f)
+        if not promises:
+            return
+        now = datetime.now(timezone.utc)
+        for p in promises:
+            key = f"promise:{p.get('id', '')}"
+            if key in self._suggest_cooldown:
+                continue
+            try:
+                ts = datetime.fromisoformat(p.get('timestamp', ''))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if (now - ts).total_seconds() < self._PROMISE_MIN_AGE_S:
+                    continue
+            except ValueError:
+                pass
+            contact = self._promise_contact(p.get('text', ''))
+            if contact and any(
+                contact.lower() in (d.get('text') or '').lower()
+                and (d.get('timestamp') or '') > (p.get('timestamp') or '')
+                for d in deliveries
+            ):
+                continue  # delivered after the promise — kept
+            # Route back to the originating conversation: promise facts carry
+            # the chat stream name as provenance (merges may concatenate).
+            provenance = p.get('provenance') or ''
+            chat_seg = next(
+                (seg.strip() for seg in provenance.split('|')
+                 if seg.strip().startswith('chat_')),
+                None,
+            )
+            if chat_seg is None:
+                log.debug("Promise sweep: no chat provenance on %r — skipped",
+                          p.get('text', '')[:80])
+                continue
+            self._suggest_cooldown[key] = tick
+            from messaging import Messages
+            follow_up = (
+                f"[internal follow-up — not a user message] You promised "
+                f"{contact or 'the user'}: \"{p.get('text', '')}\" at "
+                f"{p.get('timestamp', '')} and no delivery has been recorded. "
+                f"Deliver the promised result NOW using your tools, or "
+                f"apologize briefly and explain why you cannot. "
+                f"Do not promise again."
+            )
+            self.brain.post_message("stream_factory", Messages.chat_follow_up(
+                stream_name=chat_seg, text=follow_up, contact=contact,
+            ))
+            self.add_to_log(
+                f"Flagged unkept promise to {contact or '?'} — "
+                f"follow-up via '{chat_seg}'"
+            )
+
+    @staticmethod
+    def _promise_contact(text: str) -> str:
+        """Extract <contact> from the canonical 'Iyye promised <contact>: …'."""
+        m = re.match(r"(?i)iyye promised\s+([^:]{1,60}):", text.strip())
+        return m.group(1).strip() if m else ""
+
+    # ------------------------------------------------------------------
+    # Promise backstop (dreaming): catch commitments the STM extractor's
+    # phrasing missed, so the awake promise sweep can still repair them.
+    # ------------------------------------------------------------------
+
+    # First-person future-action commitments ("I'll send you …", "let me check …").
+    _PROMISE_INTENT_RE = re.compile(
+        r"\b(i['’]?ll|i\s+will|i['’]?m\s+going\s+to|let\s+me)\b[^.!?]{0,60}?\b"
+        r"(get|send|fetch|grab|look(?:\s+up|\s+into)?|check|find|research|remind|"
+        r"update|tell|let\s+you\s+know|get\s+back|reach\s+out|message|email|"
+        r"notify|figure\s+out|work\s+on|put\s+together|draft|prepare|schedule|"
+        r"set\s+up|follow\s+up|dig\s+into)\b",
+        re.IGNORECASE)
+
+    def sleep_phases(self) -> List[SleepPhase]:
+        # Order 65: before replay (70) consolidates/clears STM, so the day's
+        # promise facts are still present for the dedup check.
+        return [SleepPhase(
+            "promise_backstop", lambda brain: self._sleep_promise_backstop(), 65,
+        )]
+
+    def _sleep_promise_backstop(self) -> bool:
+        """Scan this cycle's outward chat replies for commitment language and,
+        for any commitment not already captured as a promise fact (the
+        extractor phrased it differently), record one — so the awake promise
+        sweep repairs it.  Deduped against today's promise facts to avoid
+        double follow-ups."""
+        journal = getattr(self.brain, "journal", None)
+        stm = getattr(self.brain, "stm", None)
+        if journal is None or stm is None:
+            return True
+        cycle = getattr(journal, "cycle_id", None)
+        if cycle is None:
+            return True
+        try:
+            today = stm.get_all_today()
+            events = journal.read_cycle(cycle, types=frozenset({"stream_activity"}))
+        except Exception as exc:
+            log.debug("Promise backstop: read failed: %s", exc)
+            return True
+        promise_toks = [self._toks(f.get("text", "")) for f in today
+                        if f.get("text", "").lower().startswith("iyye promised")]
+        last_sender: Dict[str, str] = {}
+        added = 0
+        for e in events:
+            stream = e.get("stream", "") or ""
+            text = e.get("text", "") or ""
+            m = re.match(r"USER \(([^)]+)\):", text)
+            if m:
+                last_sender[stream] = m.group(1).strip()
+                continue
+            if not (stream.startswith("chat_") and text.startswith("IYYE:")):
+                continue
+            reply = text[len("IYYE:"):].strip()
+            if not self._PROMISE_INTENT_RE.search(reply):
+                continue
+            rt = self._toks(reply)
+            if any(self._tok_overlap(rt, pt) >= 0.5 for pt in promise_toks):
+                continue  # already captured by extraction
+            contact = last_sender.get(stream, "the user")
+            try:
+                # provenance = the chat stream name so the sweep routes the
+                # follow-up back to that conversation.
+                stm.add_fact(f"Iyye promised {contact}: {reply[:160]}",
+                             confidence=0.6, provenance=stream, time_frame="today")
+                promise_toks.append(rt)
+                added += 1
+            except Exception as exc:
+                log.debug("Promise backstop: add_fact failed: %s", exc)
+        if added:
+            self.add_to_log(
+                f"Promise backstop: recovered {added} missed commitment(s)")
+        return True
+
+    @staticmethod
+    def _toks(text: str) -> frozenset:
+        return frozenset(w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+                         if len(w) > 2)
+
+    @staticmethod
+    def _tok_overlap(a: frozenset, b: frozenset) -> float:
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    def _pump_conscious_report(self, state: Dict[str, Any]) -> None:
+        """Apply a finished introspective report, and — when conscious, due,
+        and idle — submit a new one through the async scheduler."""
+        # Apply a completed report (may land after a demotion — that's fine).
+        result = self._llm_poll()
+        if result is not None:
+            if not result.discarded and result.ok and result.text:
+                self.add_to_log(f"Introspective report: {result.text[:120]}")
+                self.add_output(result.text, target="introspection")
+            return
+        # A report is still being generated — wait.
+        if self._llm_busy():
+            return
+        if not self.is_conscious:
+            return
+
         tick = getattr(self.brain, '_tick_counter', 0)
         if self._conscious_since_tick is None:
             self._conscious_since_tick = tick
-
         # Rate-limit: only produce a report once every 20 ticks while conscious.
         if (tick - self._conscious_since_tick) % 20 != 0:
             return
+        self._submit_conscious_report(state)
 
+    def _submit_conscious_report(self, state: Dict[str, Any]) -> None:
+        """Build the introspection prompt and submit it (reasoning, conscious)."""
         self.add_to_log("Conscious: generating introspective report")
-        self.checkpoint()
+        try:
+            self.checkpoint()
+        except StopIteration:
+            return
 
         try:
             llm_info = state['llm']
@@ -475,36 +710,52 @@ class SelfReflectionStream(ProcessingStream):
 
             recent_facts = self._get_recent_facts_text()
 
-            router = getattr(getattr(self, 'brain', None), 'llm_router', None)
-            if router is not None:
-                llm = router.get_client(role="reasoning", conscious=True)
-            else:
-                from llm_client import LLMClient
-                llm = LLMClient()
-            report = llm.complete_from_file(
-                "self_reflection_conscious",
-                timestamp=state['timestamp'],
-                iyye_day=str(state['iyye_day']),
-                hardware=(
-                    f"CPU={state['cpu_percent']:.1f}%, "
-                    f"mem={state['memory_percent']:.1f}%, "
-                    f"disk={state['disk_percent']:.1f}%"
-                ),
-                adenosine=f"{state['adenosine_level']:.3f}",
-                brain_state=state['current_state'],
-                llm_status=llm_text,
-                sensors=sensor_lines,
-                actuators=actuator_lines,
-                streams=stream_lines,
-                recent_facts=recent_facts,
+            # Cognitive position (HLD: self-reflection "monitors Iyye
+            # position") — gathered in state['position'] but previously never
+            # passed to the prompt, leaving "what are you focused on?"
+            # unanswerable.
+            pos = state.get('position', {}) or {}
+            position_text = (
+                f"focused on: {pos.get('conscious_stream') or '(none)'}, "
+                f"active streams: {pos.get('streams_active', 0)}, "
+                f"facts known: {pos.get('facts_in_memory', 0)}"
             )
-            self.add_to_log(f"Introspective report: {report[:120]}")
-            self.add_output(report, target="introspection")
 
+            plan_store = getattr(self.brain, 'plan_store', None)
+            plan_lines = "(none)"
+            if plan_store is not None:
+                try:
+                    summaries = [p.summary_line()
+                                 for p in plan_store.all_plans()][:5]
+                    if summaries:
+                        plan_lines = "\n".join(f"  {s}" for s in summaries)
+                except Exception:
+                    pass
+
+            self._llm_submit(
+                role="reasoning", kind="reflection", conscious=True,
+                call=LLMCall.from_file(
+                    "self_reflection_conscious",
+                    timestamp=state['timestamp'],
+                    iyye_day=str(state['iyye_day']),
+                    hardware=(
+                        f"CPU={state['cpu_percent']:.1f}%, "
+                        f"mem={state['memory_percent']:.1f}%, "
+                        f"disk={state['disk_percent']:.1f}%"
+                    ),
+                    adenosine=f"{state['adenosine_level']:.3f}",
+                    brain_state=state['current_state'],
+                    llm_status=llm_text,
+                    sensors=sensor_lines,
+                    actuators=actuator_lines,
+                    streams=stream_lines,
+                    position=position_text,
+                    plans=plan_lines,
+                    recent_facts=recent_facts,
+                ),
+            )
         except Exception as exc:
-            log.warning("Self-reflection conscious report failed: %s", exc)
-        finally:
-            self.checkpoint()
+            log.warning("Self-reflection report build failed: %s", exc)
 
     def _gather_system_state(self) -> Dict[str, Any]:
         """Gather comprehensive system state."""
@@ -645,6 +896,20 @@ class SelfReflectionStream(ProcessingStream):
                 'ticks_since_conscious': ticks_since,
             })
         return meta
+
+    def _chat_llm_state(self) -> str:
+        """Authoritative chat-model state from the health owner (llm_management),
+        or "down" if it isn't reachable — so self-reflection defers the restart
+        decision to the owner instead of racing the health check."""
+        mgmt = next(
+            (s for s in getattr(self.brain, 'streams', [])
+             if hasattr(s, 'chat_llm_state')),
+            None,
+        )
+        try:
+            return mgmt.chat_llm_state() if mgmt is not None else "down"
+        except Exception:
+            return "down"
 
     def _get_llm_health(self) -> Dict[str, Any]:
         """Return LLM health for all registered models.

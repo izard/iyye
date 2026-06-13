@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from iyye_base import PROJECT_ROOT, ProcessingStream
+from llm_scheduler import LLMCall, LLMConsumerMixin
 
 if TYPE_CHECKING:
     from main_loop import IyyeBrain
@@ -36,7 +37,7 @@ log = logging.getLogger("Iyye")
 _CONTACTS_PATH = PROJECT_ROOT / "iyye_memory" / "contacts.json"
 
 
-class TheoryOfMindStream(ProcessingStream):
+class TheoryOfMindStream(LLMConsumerMixin, ProcessingStream):
     """
     Maintains a contact list of humans and agents with social interaction
     history and inferred psychological profiles.  Provides a synchronous
@@ -58,6 +59,10 @@ class TheoryOfMindStream(ProcessingStream):
         self._profile_tick: int = 0
         self._save_tick: int = 0
         self._dirty: bool = False
+        # Context for the profile inference currently submitted to the async
+        # scheduler (or None).  Stashed by contact id so the result is applied
+        # against the live contact map even if it changed while the job ran.
+        self._pending_profile: Optional[Dict[str, Any]] = None
 
         self._load_contacts()
 
@@ -103,12 +108,19 @@ class TheoryOfMindStream(ProcessingStream):
         self._profile_tick += 1
         self._save_tick += 1
 
-        # 2. Periodically infer/refresh psychological profiles via LLM.
-        if self._profile_tick >= self._PROFILE_INTERVAL:
-            self._profile_tick = 0
-            self._update_stale_profiles()
+        # 2. Apply a finished profile inference (ran on a scheduler worker, not
+        #    the main loop).
+        result = self._llm_poll()
+        if result is not None:
+            self._on_profile_result(result)
 
-        # 3. Persist to disk when dirty.
+        # 3. Periodically submit a profile refresh for one stale contact/persona,
+        #    unless one is already in flight (one-job-per-stream rule).
+        if self._profile_tick >= self._PROFILE_INTERVAL and not self._llm_busy():
+            self._profile_tick = 0
+            self._submit_stale_profile()
+
+        # 4. Persist to disk when dirty.
         if self._dirty and self._save_tick >= self._SAVE_INTERVAL:
             self._save_tick = 0
             self._save_contacts()
@@ -286,13 +298,65 @@ class TheoryOfMindStream(ProcessingStream):
     def is_contact_trusted(self, contact_id: str) -> bool:
         """Return whether a contact (or any contact in its persona) is trusted.
 
-        HLD: "telegram … Users assumed not trusted, unless instructed by
-        trusted user."  The trust flag is set via set_contact_trusted().
+        HLD: telegram users are assumed not trusted; the ONLY way one becomes
+        trusted is an explicit owner command from the local web chat.  The
+        flag is set via set_contact_trusted(), whose chat-side caller
+        (UserChatStream._execute_trust_action) enforces the local-only rule.
         """
         for c in self._persona_group(contact_id):
             if c.get("trusted", False):
                 return True
         return False
+
+    def find_contacts(self, query: str):
+        """Return ``[(contact_id, display_name), ...]`` for contacts matching
+        *query* by explicit contact id (e.g. ``telegram_123``), exact id, or a
+        display-name substring (case-insensitive).
+
+        Public lookup so callers (e.g. chat trust actions) don't reach into the
+        private ``_contacts`` map directly."""
+        q = (query or "").strip().lower()
+        explicit = set(re.findall(r"telegram_\d+", q))
+        out = []
+        for cid, contact in self._contacts.items():
+            display = contact.get("display_name") or ""
+            if cid in explicit or cid.lower() == q or (display and q in display.lower()):
+                out.append((cid, display or cid))
+        return out
+
+    def known_contacts(self):
+        """Return ``[(contact_id, display_name), ...]`` for every known contact.
+
+        Public enumeration (companion to :meth:`find_contacts`) so callers —
+        e.g. the planner detecting contacts mentioned in plan-step text —
+        don't reach into the private ``_contacts`` map."""
+        return [
+            (cid, c.get("display_name") or cid)
+            for cid, c in self._contacts.items()
+        ]
+
+    def detect_contacts_in_text(self, text: str):
+        """Return ``[(contact_id, display_name), ...]`` for every known contact
+        whose display name appears as a whole word in *text*.
+
+        Used by unified recall to surface a third party's interaction history
+        when they are *named in a question* ("when did Jacob contact you?").
+        Names under 3 chars and the "unknown" placeholder are skipped to avoid
+        false positives; deduped by contact id."""
+        import re as _re
+        low = (text or "").lower()
+        if not low:
+            return []
+        out = []
+        seen = set()
+        for cid, contact in self._contacts.items():
+            name = (contact.get("display_name") or "").strip().lower()
+            if len(name) < 3 or name == "unknown" or cid in seen:
+                continue
+            if _re.search(rf"\b{_re.escape(name)}\b", low):
+                out.append((cid, contact.get("display_name") or cid))
+                seen.add(cid)
+        return out
 
     def ensure_contact(
         self,
@@ -449,10 +513,12 @@ class TheoryOfMindStream(ProcessingStream):
     # LLM-based psychological profiling
     # ------------------------------------------------------------------
 
-    def _update_stale_profiles(self) -> None:
-        """Find one contact/persona needing a profile refresh and update it."""
+    def _find_stale_profile(self):
+        """Return ``(contact, interactions, total_count, group)`` for one
+        contact/persona that has accumulated enough new interactions to warrant
+        a profile refresh, or None.  One per cycle to avoid LLM contention."""
         seen_personas: set = set()
-        for contact in self._contacts.values():
+        for contact in list(self._contacts.values()):
             persona = contact.get("persona")
             if persona:
                 if persona in seen_personas:
@@ -475,78 +541,83 @@ class TheoryOfMindStream(ProcessingStream):
                 continue
 
             all_interactions.sort(key=lambda i: i.get("timestamp", ""))
-            self._update_single_profile(contact, all_interactions,
-                                        total_count, group)
-            return  # one per cycle to avoid LLM contention
+            return contact, all_interactions, total_count, group
+        return None
 
-    def _update_single_profile(
-        self,
-        contact: Dict[str, Any],
-        interactions: Optional[List[Dict[str, Any]]] = None,
-        total_count: Optional[int] = None,
-        group: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        if interactions is None:
-            interactions = contact.get("interactions", [])
-        if total_count is None:
-            total_count = contact.get("interaction_count", 0)
-        if group is None:
-            group = [contact]
+    def _submit_stale_profile(self) -> None:
+        """Find one stale contact/persona and submit its profile inference to
+        the async scheduler.  The result is applied in _on_profile_result."""
+        found = self._find_stale_profile()
+        if found is None:
+            return
+        contact, interactions, total_count, group = found
 
-        try:
-            router = getattr(self.brain, "llm_router", None)
-            if router is not None:
-                llm = router.get_client(role="fast", no_think=True, max_tokens=512)
-            else:
-                from llm_client import LLMClient
-                llm = LLMClient(no_think=True, max_tokens=512)
+        recent = interactions[-15:]
+        interactions_text = "\n".join(
+            f"  [{i.get('timestamp', '?')[:16]}] User: {i.get('user_said', '')[:200]}\n"
+            f"  Iyye: {i.get('iyye_said', '')[:200]}"
+            for i in recent
+        )
+        old_profile = contact.get("psychological_profile")
+        existing = ""
+        if old_profile and old_profile.get("summary"):
+            existing = old_profile["summary"]
 
-            recent = interactions[-15:]
-            interactions_text = "\n".join(
-                f"  [{i.get('timestamp', '?')[:16]}] User: {i.get('user_said', '')[:200]}\n"
-                f"  Iyye: {i.get('iyye_said', '')[:200]}"
-                for i in recent
-            )
-
-            existing = ""
-            old_profile = contact.get("psychological_profile")
-            if old_profile and old_profile.get("summary"):
-                existing = old_profile["summary"]
-
-            response = llm.complete_from_file(
+        submitted = self._llm_submit(
+            role="fast", kind="profile",
+            call=LLMCall.from_file(
                 "theory_of_mind_profile",
                 contact_name=contact.get("display_name", "unknown"),
                 interaction_count=str(total_count),
                 interactions=interactions_text,
                 existing_profile=existing or "(first assessment)",
-            )
+            ),
+            client_kwargs={"no_think": True, "max_tokens": 512},
+        )
+        if submitted:
+            # Stash by contact id (not dict ref) so the result is applied
+            # against the live contact map, which may change while the job runs.
+            self._pending_profile = {
+                "contact_name": contact.get("display_name", "unknown"),
+                "group_ids": [c["contact_id"] for c in group],
+                "total_count": total_count,
+            }
 
-            profile = self._parse_profile(response)
-            if profile:
-                profile["last_updated"] = datetime.now(timezone.utc).isoformat()
-                profile["interaction_count_at_update"] = total_count
-                # Store profile on every contact in the group so any
-                # lookup returns it without needing a join.
-                for c in group:
-                    c["psychological_profile"] = profile
-                self._dirty = True
-                pname = contact.get('display_name', '?')
-                self.add_to_log(f"Updated profile for {pname}")
-                # Persist profile summary to STM so it reaches LTM.
-                stm = getattr(self.brain, 'stm', None)
-                if stm:
-                    stm.add_fact(
-                        f"Psychological profile for {pname}: {profile['summary']}",
-                        confidence=0.6,
-                        provenance="theory_of_mind",
-                        time_frame="permanent",
-                    )
+    def _on_profile_result(self, result) -> None:
+        """Apply a finished profile inference on the main thread."""
+        ctx = self._pending_profile or {}
+        self._pending_profile = None
+        if result.discarded or not result.ok:
+            if not result.discarded:
+                log.warning("TheoryOfMind: profile update failed: %s", result.error)
+            return
+        profile = self._parse_profile(result.text)
+        if not profile:
+            return
+        profile["last_updated"] = datetime.now(timezone.utc).isoformat()
+        profile["interaction_count_at_update"] = ctx.get("total_count", 0)
 
-        except Exception as exc:
-            log.warning(
-                "TheoryOfMind: profile update failed for %s: %s",
-                contact.get("contact_id"),
-                exc,
+        # Store profile on every (still-present) contact in the group so any
+        # lookup returns it without needing a join.
+        applied: List[Dict[str, Any]] = []
+        for cid in ctx.get("group_ids", []):
+            c = self._contacts.get(cid)
+            if c is not None:
+                c["psychological_profile"] = profile
+                applied.append(c)
+        if not applied:
+            return
+        self._dirty = True
+        pname = ctx.get("contact_name", "?")
+        self.add_to_log(f"Updated profile for {pname}")
+        # Persist profile summary to STM so it reaches LTM.
+        stm = getattr(self.brain, 'stm', None)
+        if stm:
+            stm.add_fact(
+                f"Psychological profile for {pname}: {profile['summary']}",
+                confidence=0.6,
+                provenance="theory_of_mind",
+                time_frame="permanent",
             )
 
     @staticmethod
@@ -578,8 +649,8 @@ class TheoryOfMindStream(ProcessingStream):
         """Block wind-down while we have unsaved contact data or pending mail."""
         if self._dirty:
             return False
-        pending = self.brain._mailboxes.get("theory_of_mind")
-        if pending:
+        # Thread-safe peek instead of reaching into the shared mailbox dict.
+        if self.brain.peek_messages("theory_of_mind"):
             return False
         return super().can_stop_safely()
 
@@ -589,6 +660,15 @@ class TheoryOfMindStream(ProcessingStream):
             self._handle_message(msg)
         if self._dirty:
             self._save_contacts()
+
+    def on_pause(self) -> None:
+        """Hook called during the brain's settle phase before sleep.
+
+        Flushes pending mailbox messages and dirty contacts so the post-sleep
+        snapshot is consistent.  Replaces the explicit ToM-flush special-case
+        that used to live in IyyeBrain._enter_asleep.
+        """
+        self.flush()
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         super().restore_state(state)

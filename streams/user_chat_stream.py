@@ -23,10 +23,12 @@ queues (web_chat, telegram, microphone) contain new messages.
 import json
 import logging
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from iyye_base import PROJECT_ROOT, ProcessingStream
+from llm_scheduler import LLMCall, LLMConsumerMixin
 
 if TYPE_CHECKING:
     from main_loop import IyyeBrain
@@ -34,10 +36,16 @@ if TYPE_CHECKING:
 log = logging.getLogger("Iyye")
 
 
-class UserChatStream(ProcessingStream):
+class UserChatStream(LLMConsumerMixin, ProcessingStream):
     """
     Processes incoming user messages with LLM and routes responses to actuators.
     Can become conscious (priority 5, higher than self-reflection's 3).
+
+    LLM calls go through the async scheduler so the main loop never blocks on a
+    chat decode.  A turn spans up to two LLM stages — 'generate' (the reply)
+    and, if the reply carries a python ACTION, 'rephrase' (tool output → answer)
+    — tracked in ``self._turn``.  One in-flight job per stream gives per-contact
+    response ordering for free (each contact has its own UserChatStream).
     """
 
     # Instances are created on-demand by StreamFactory, not by the stream loader.
@@ -62,6 +70,17 @@ class UserChatStream(ProcessingStream):
         # HLD: "local web chat … user is assumed trusted"; "telegram …
         # Users assumed not trusted, unless instructed by trusted user."
         self._trusted: bool = self._is_trusted_source(sensor_name)
+        # In-flight chat turn across async LLM stages, or None when idle.
+        # Shape: {"stage": "generate"|"rephrase", "user_text", "source", ...}.
+        self._turn: Optional[Dict[str, Any]] = None
+        # Consecutive transient-failure retries for the head message; reset
+        # whenever a message is committed (popped).
+        self._generate_retries: int = 0
+        # Recall results from the current turn, stashed for usefulness
+        # attribution once the reply is produced (#5 retrieval-quality signal).
+        self._last_recall: List[Any] = []
+        # Armed after a fact-using turn; the next message scores satisfaction.
+        self._pending_feedback: Optional[Dict[str, Any]] = None
 
         # Populate input_history so _select_conscious_for_interrupt finds this stream
         for msg in messages:
@@ -88,7 +107,7 @@ class UserChatStream(ProcessingStream):
         """
         if self._is_trusted_source(self._sensor_name):
             return True
-        tom = getattr(self.brain, '_tom_stream', None)
+        tom = self.brain.theory_of_mind()
         if tom is None:
             return False
         contact_id = tom.make_contact_id(
@@ -99,112 +118,43 @@ class UserChatStream(ProcessingStream):
         )
         return tom.is_contact_trusted(contact_id)
 
-    _TRUST_RE = re.compile(
-        r'\b(trust|untrust)\s+(?:@?(\w+))'           # "trust Alex", "untrust Jacob"
-        r'|\b(?:make|promote|add)\s+(?:@?(\w+))\s+.*?\b(trusted)\b'  # "make Alex trusted", "promote Alex to trusted"
-        r'|\b(trusted)\b.*?\b(?:for|to)\s+(?:@?(\w+))',              # "grant trusted to Alex"
-        re.IGNORECASE,
-    )
-
-    def _detect_trust_change(self, user_text: str) -> Optional[str]:
-        """If a trusted user says 'trust <name>' or 'untrust <name>', update trust.
-
-        Also matches natural phrasings: "make Alex trusted", "promote Alex to
-        trusted status", "grant trusted to Alex".
-
-        Searches Theory of Mind contacts by contact_id first, then by display
-        name.  When multiple contacts share a display name, **all** of them
-        are updated.  Only callable from an already-trusted stream.
-        Returns a feedback string for the user, or None if no command matched.
-        """
-        m = self._TRUST_RE.search(user_text)
-        if not m:
-            return None
-
-        # The regex has three alternatives with different group layouts:
-        #   Alt 1 (groups 1,2): "trust Alex" / "untrust Alex"
-        #   Alt 2 (groups 3,4): "make Alex trusted" / "promote Alex to trusted"
-        #   Alt 3 (groups 5,6): "grant trusted to Alex"
-        if m.group(1):
-            verb = m.group(1).lower()
-            target_name = m.group(2).lower()
-            granting = verb != "untrust"
-        elif m.group(3):
-            target_name = m.group(3).lower()
-            granting = True  # "make X trusted" is always granting
-        else:
-            target_name = m.group(6).lower()
-            granting = True  # "grant trusted to X" is always granting
-
-        tom = getattr(self.brain, '_tom_stream', None)
-        if tom is None:
-            return None
-
-        # Also scan the full message for contact_id patterns (telegram_123...)
-        # so "grant trust to telegram_6473529683" works even though the regex
-        # only captured a partial target_name.
-        _CID_RE = re.compile(r'telegram_\d+')
-        explicit_cids = set(_CID_RE.findall(user_text))
-
-        updated = []
-        for cid, contact in tom._contacts.items():
-            display = (contact.get("display_name") or "").lower()
-            matched = (
-                cid in explicit_cids
-                or (display and target_name in display)
-            )
-            if matched and tom.set_contact_trusted(cid, granting):
-                actual_name = contact.get('display_name', cid)
-                updated.append(f"{actual_name} ({cid})")
-
-        if updated:
-            action_word = "Granted" if granting else "Revoked"
-            summary = ", ".join(updated)
-            self.add_to_log(f"Trusted user {action_word.lower()} trust for {summary}")
-            return f"{action_word} trust for {summary}."
-
-        # Contact may not exist yet if they just sent their first message
-        # in this same tick.  Don't fail — report clearly so the user can retry.
-        self.add_to_log(f"Trust change failed: no contact matching '{target_name}'")
-        return f"No known contact matching '{target_name}'. They need to send a message first so I can identify them."
-
     def _execute_trust_action(self, action: Dict[str, Any]) -> Optional[str]:
-        """Handle ACTION: {"type": "trust"/"untrust", "contact": "<name>"}.
+        """Handle ACTION: {"type": "trust"/"untrust", "contact": "<name or telegram_<id>>"}.
 
-        Allows the LLM to programmatically grant/revoke trust when it decides
-        a user has authenticated (e.g. via PIN verification).
+        SECURITY: the ONLY way a remote (Telegram) user becomes trusted is an
+        explicit command from the local web chat (127.0.0.1, the machine
+        owner).  The capability profile in execute() already restricts this
+        action to the local-owner tier; the source check here is
+        defence-in-depth.  The old PIN-style self-verification path (and the
+        last-resort "trust the current sender" fallback) was removed — it let
+        an untrusted sender talk the LLM into granting them trust.
 
-        Matches contacts by contact_id first, then by display name.  When
-        multiple contacts share a display name all of them are updated.
-        If no contact is found, creates one for the current sender so that
-        self-trust (PIN verification) succeeds even on the first interaction.
+        Matches contacts by explicit contact id (``telegram_<id>``) or by
+        display-name substring.  When multiple contacts share a display name
+        all of them are updated.  The contact must already exist (i.e. has
+        messaged at least once) — trust is never granted to an account Iyye
+        has never seen.
         """
+        if not self._is_trusted_source(self._sensor_name):
+            self.add_to_log(
+                f"SECURITY: blocked trust action from non-local source "
+                f"'{self._sensor_name}' — trust changes are local-web-chat only"
+            )
+            return None
         target_name = (action.get('contact') or '').strip().lower()
         if not target_name:
             self.add_to_log("Trust action missing 'contact' field — ignored")
             return None
         granting = action['type'] == 'trust'
-        tom = getattr(self.brain, '_tom_stream', None)
+        tom = self.brain.theory_of_mind()
         if tom is None:
             self.add_to_log("Trust action failed: Theory of Mind stream not available")
             return None
 
-        # Scan for explicit contact_id in the action value (e.g. "telegram_123").
-        _CID_RE = re.compile(r'telegram_\d+')
-        explicit_cids = set(_CID_RE.findall(target_name))
-
-        # Match by contact_id or display name — update ALL matches.
         updated = []
-        for cid, contact in tom._contacts.items():
-            display = (contact.get("display_name") or "").lower()
-            matched = (
-                cid in explicit_cids
-                or cid == target_name
-                or (display and target_name in display)
-            )
-            if matched and tom.set_contact_trusted(cid, granting):
-                actual_name = contact.get('display_name', cid)
-                updated.append(f"{actual_name} ({cid})")
+        for cid, display in tom.find_contacts(target_name):
+            if tom.set_contact_trusted(cid, granting):
+                updated.append(f"{display} ({cid})")
 
         if updated:
             verb = "Granted" if granting else "Revoked"
@@ -212,27 +162,12 @@ class UserChatStream(ProcessingStream):
             self.add_to_log(f"ACTION {verb.lower()} trust for {summary}")
             return f"{verb} trust for {summary}."
 
-        # Contact not found — likely a timing issue: the interaction was
-        # posted to the ToM mailbox but hasn't been processed yet.  Create
-        # the contact for the current sender so self-trust doesn't fail.
-        contact_id = tom.make_contact_id(
-            self._last_sender_name, self._sensor_name,
-            self._last_chat_id, self._last_user_id,
+        self.add_to_log(f"Trust action failed for '{target_name}' — no matching contact")
+        return (
+            f"I don't know any contact matching '{target_name}' yet. "
+            f"They need to message me at least once before I can "
+            f"{'trust' if granting else 'untrust'} them."
         )
-        display = self._last_sender_name or target_name
-        tom.ensure_contact(
-            contact_id,
-            display_name=display,
-            source=self._sensor_name,
-            chat_id=self._last_chat_id,
-        )
-        if tom.set_contact_trusted(contact_id, granting):
-            verb = "Granted" if granting else "Revoked"
-            self.add_to_log(f"ACTION {verb.lower()} trust for {display} (created contact {contact_id})")
-            return f"{verb} trust for {display} ({contact_id})."
-
-        self.add_to_log(f"Trust action failed for '{target_name}' (contact_id={contact_id})")
-        return f"Failed to {'grant' if granting else 'revoke'} trust for '{target_name}'."
 
     # ------------------------------------------------------------------
     # LLM management actions
@@ -257,18 +192,16 @@ class UserChatStream(ProcessingStream):
             entry = next((m for m in router._registry if m['name'] == model_name), None)
             if entry is None:
                 return f"[LLM] Unknown model '{model_name}'."
-            self.brain.post_message("llm_management", {
-                "action": "start",
-                "script": entry["script"],
-            })
+            from messaging import Messages
+            self.brain.post_message("llm_management",
+                                    Messages.start_llm(script=entry["script"]))
             self.add_to_log(f"Requested LLM start: {model_name}")
             return f"[LLM] Starting {model_name} — this may take a minute."
 
         elif command == 'stop':
-            self.brain.post_message("llm_management", {
-                "action": "stop",
-                "name": model_name,
-            })
+            from messaging import Messages
+            self.brain.post_message("llm_management",
+                                    Messages.stop_llm(name=model_name))
             self.add_to_log(f"Requested LLM stop: {model_name}")
             return f"[LLM] Stopping {model_name}."
 
@@ -285,8 +218,19 @@ class UserChatStream(ProcessingStream):
             return f"[LLM] Unknown command '{command}'."
 
     def _execute_persona_action(self, action: Dict[str, Any]) -> Optional[str]:
-        """Handle ACTION: {"type": "persona", "name": "..."}."""
-        tom = getattr(self.brain, '_tom_stream', None)
+        """Handle ACTION: {"type": "persona", "name": "..."}.
+
+        Local-web-chat only (defence-in-depth; the capability profile already
+        denies it for remote senders): persona linking propagates trust across
+        accounts, so it is restricted to the same channel as trust changes.
+        """
+        if not self._is_trusted_source(self._sensor_name):
+            self.add_to_log(
+                f"SECURITY: blocked persona action from non-local source "
+                f"'{self._sensor_name}' — persona linking is local-web-chat only"
+            )
+            return None
+        tom = self.brain.theory_of_mind()
         if tom is None:
             return "[Persona] Theory of Mind stream not available."
         name = (action.get('name') or '').strip()
@@ -295,6 +239,70 @@ class UserChatStream(ProcessingStream):
         if tom.link_by_display_name(name):
             return f"[Persona] Linked all contacts named '{name}' into one persona."
         return f"[Persona] Found fewer than 2 contacts named '{name}' — nothing to link."
+
+    # ------------------------------------------------------------------
+    # Long term plan actions
+    # ------------------------------------------------------------------
+
+    def _execute_plan_action(self, action: Dict[str, Any]) -> Optional[str]:
+        """Handle ACTION: {"type": "plan", "command": "create|approve|abandon|list", ...}.
+
+        SECURITY: ``source`` is stamped from the channel this stream serves
+        (``self._sensor_name``), never from LLM output, so a remote sender
+        cannot forge a local-owner approval.  approve/abandon are local-web-
+        chat only (defence-in-depth — PlanStore gates on source again); a
+        remote *trusted* contact may create a plan, but it lands in
+        ``proposed`` state for the owner to approve.
+        """
+        command = (action.get('command') or '').strip().lower()
+        local = self._is_trusted_source(self._sensor_name)
+        source = 'web_chat' if local else (self._sensor_name or 'remote_chat')
+        from messaging import Messages
+
+        if command == 'create':
+            goal = (action.get('goal') or '').strip()
+            if not goal:
+                return "[Plan] No goal provided."
+            self.brain.post_message("planner", Messages.plan_propose(
+                goal=goal, source=source,
+                deadline=action.get('deadline'),
+            ))
+            self.add_to_log(f"Proposed plan: {goal[:80]}")
+            if local:
+                return f"[Plan] Created and activated: {goal[:120]}"
+            return (f"[Plan] Proposed: {goal[:120]} — the owner must approve "
+                    f"it from the local web chat before it runs.")
+
+        if command in ('approve', 'abandon'):
+            if not local:
+                self.add_to_log(
+                    f"SECURITY: blocked plan {command} from non-local source "
+                    f"'{self._sensor_name}' — plan lifecycle is local-web-chat only"
+                )
+                return None
+            plan_id = (action.get('plan_id') or '').strip()
+            if not plan_id:
+                return "[Plan] No plan_id provided."
+            msg = (Messages.plan_approve(plan_id=plan_id, source=source)
+                   if command == 'approve'
+                   else Messages.plan_abandon(plan_id=plan_id, source=source))
+            self.brain.post_message("planner", msg)
+            verb = 'Approved' if command == 'approve' else 'Abandoned'
+            self.add_to_log(f"{verb} plan '{plan_id}'")
+            return f"[Plan] {verb} '{plan_id}'."
+
+        if command == 'list':
+            store = getattr(self.brain, 'plan_store', None)
+            if store is None:
+                return "[Plan] Plan store not available."
+            plans = store.all_plans()
+            if not plans:
+                return "[Plan] No long term plans."
+            return "[Plan] Current plans:\n" + "\n".join(
+                p.summary_line() for p in plans
+            )
+
+        return f"[Plan] Unknown command '{command}'."
 
     # ------------------------------------------------------------------
     # Message extraction helpers
@@ -361,58 +369,63 @@ class UserChatStream(ProcessingStream):
         return str(data).strip() if data else '', None, None, None
 
     # ------------------------------------------------------------------
-    # LLM lazy init
-    # ------------------------------------------------------------------
-
-    def _get_llm(self):
-        # Re-acquire each call: conscious status can change between ticks,
-        # and the router directs conscious streams to the most powerful model.
-        # Web chat is local/admin-only — use the fast model to keep the heavy
-        # model free for Telegram and subconscious streams.
-        try:
-            router = getattr(getattr(self, 'brain', None), 'llm_router', None)
-            if router is not None:
-                is_web = self._is_trusted_source(self._sensor_name)
-                role = "fast" if is_web else "chat"
-                return router.get_client(
-                    role=role, conscious=self.is_conscious, no_think=True,
-                )
-            from llm_client import LLMClient
-            return LLMClient(no_think=True)
-        except Exception as exc:
-            log.warning("UserChatStream: LLM unavailable: %s", exc)
-            return None
-
-    # ------------------------------------------------------------------
     # Main execution
     # ------------------------------------------------------------------
 
     def execute(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process the next pending message, call LLM, send response."""
-        # Drain any empty/unparseable messages silently — peek before popping
-        # so a message is never lost if a stop is requested mid-execution.
+        """Async chat turn: poll a finished LLM stage and apply it, else (when
+        idle) start the next pending message's turn.  The blocking LLM call(s)
+        run on a scheduler worker; the main loop is never blocked."""
+        # A trusted-user python tool is running on its own thread — check it
+        # first (it isn't a scheduler job, so the LLM poll/busy logic below
+        # would mis-handle it and reset the turn).
+        if self._turn is not None and self._turn.get("stage") == "python_running":
+            return self._poll_python(context)
+        # Apply a finished LLM stage.
+        result = self._llm_poll()
+        if result is not None:
+            return self._on_llm_result(result, context)
+        # A stage is still running — wait for it.
+        if self._llm_busy():
+            return None
+        # Not busy and no result, but a turn is still recorded → its result was
+        # dropped (e.g. the wake epoch rotated across a sleep).  Reset so the
+        # message (still queued) is reprocessed from scratch.
+        if self._turn is not None:
+            self.add_to_log("Chat turn interrupted (LLM result dropped) — retrying")
+            self._turn = None
+        return self._begin_next_turn(context)
+
+    def _begin_next_turn(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Peek the next real message, build the prompt, submit the 'generate'
+        stage.  The message is left in the queue (not popped) until its result
+        is applied, so a dropped/declined submission retries it cleanly."""
+        # Drain empty/unparseable messages (peek then pop).  An empty message
+        # is "processed" (discarded), so acknowledge it to the source sensor so
+        # Telegram stops re-delivering it.
         user_text = ''
-        chat_id = None
-        sender_name = None
-        user_id = None
+        chat_id = sender_name = user_id = None
+        update_id = None
         while self._pending_messages and not user_text:
             message = self._pending_messages[0]  # peek
             user_text, chat_id, sender_name, user_id = self._extract_text_and_chat_id(message)
+            update_id = message.get('update_id') if isinstance(message, dict) else None
             if not user_text:
-                self._pending_messages.pop(0)  # discard unparseable, safe to lose
+                self._ack_source_message(update_id)
+                self._pending_messages.pop(0)
 
         if not user_text:
-            # Queue is empty and all previous inputs have a matching output —
-            # retire this stream so it doesn't accumulate as dead weight.
+            # Queue empty and all inputs answered — retire the stream.
             if len(self.input_history) > 0 and len(self.output_history) >= len(self.input_history):
                 brain = getattr(self, 'brain', None)
                 if brain is not None:
                     try:
+                        self.request_retire("all messages processed")
                         brain.streams.remove(self)
                         log.debug("UserChatStream '%s' retired (all messages processed)", self.name)
                     except ValueError:
                         pass
-            return None  # nothing real to process this tick
+            return None
 
         if chat_id:
             self._last_chat_id = chat_id
@@ -424,111 +437,357 @@ class UserChatStream(ProcessingStream):
         source = self._sensor_name or self.name
         sender_label = self._last_sender_name or source
         self.add_to_log(f"USER ({sender_label}): {user_text}")
+        # Implicit feedback on the previous fact-using turn, read from this
+        # new message (#5 retrieval-quality signal; shadow).
+        self._emit_recall_feedback(user_text)
 
-        # Re-evaluate trust early so the LLM prompt can reflect it.
-        # Constructor sets _trusted based on sensor name alone (web_chat=True),
-        # but ToM may have granted trust to this telegram contact since then.
+        # Re-evaluate trust so the prompt and later ACTION gating reflect any
+        # change since construction (ToM may have (un)trusted this contact).
         self._trusted = self._check_contact_trusted()
 
-        # Cooperative-multitasking checkpoint BEFORE the blocking LLM call.
-        # If a stop has been requested (e.g. winding-down) this raises
-        # StopIteration here rather than committing to a 60s LLM request.
-        # The message is still at index 0 of _pending_messages — not yet consumed.
-        self.checkpoint()
+        # Cooperative stop: if winding-down requested a stop, don't submit —
+        # leave the message queued for the next wake cycle.
+        try:
+            self.checkpoint()
+        except StopIteration:
+            return None
 
-        # Commit the pop only after passing the checkpoint: if StopIteration was
-        # raised above, the message stays in the queue for the next wake cycle.
-        self._pending_messages.pop(0)
-
+        # Build the prompt context (main-thread reads: memory search, history).
         adenosine = context.get('adenosine', 1.0)
         active_streams = len(context.get('streams', []))
-        conversation_history = self._build_history()
-        # Prefer the rich self-reflection snapshot over bare counts.
-        # Falls back to brain attribute (set by SelfReflectionStream each tick).
-        sr_snapshot = context.get('self_reflection_state') or getattr(
-            self.brain, '_self_reflection_snapshot', None
-        )
-
-        system_description = self._read_system_description()
-        stm_facts = self._build_stm_context()
-        ltm_facts = self._build_ltm_context(user_text)
-        contact_context = self._get_contact_context()
-
-        response = self._generate_response(
-            user_text=user_text,
+        sr_snapshot = (context.get('self_reflection_state')
+                       or self.brain.self_reflection_snapshot())
+        history = self._build_history() or "(none)"
+        variables = dict(
+            user_message=user_text,
             source=source,
-            sender_name=self._last_sender_name,
-            conversation_history=conversation_history,
-            stm_facts=stm_facts,
-            ltm_facts=ltm_facts,
-            adenosine=adenosine,
-            active_streams=active_streams,
-            sr_snapshot=sr_snapshot,
-            system_description=system_description,
-            contact_context=contact_context,
-            context=context,
+            sender_name=self._last_sender_name or "unknown",
+            conversation_history=history,
+            stm_facts=self._build_stm_context(),
+            ltm_facts=self._build_ltm_context(user_text),
+            system_state=self._build_system_state(adenosine, active_streams, sr_snapshot),
+            system_description=self._read_system_description(),
+            contact_context=self._get_contact_context(),
+            available_actions=self._build_available_actions(user_text, history),
         )
 
-        # Parse and strip any ACTION: line before sending to the user.
-        response, action = self._extract_action(response)
+        # Typing indicator so the user knows a reply is on the way.
+        self._send_typing_indicator(context)
+
+        prompt_chars = sum(len(str(v)) for v in variables.values())
+        submitted = self._llm_submit(
+            role=self._chat_role(),
+            kind=("chat_conscious" if self.is_conscious else "chat_subconscious"),
+            conscious=self.is_conscious,
+            call=LLMCall.from_file("chat_response", **variables),
+            client_kwargs={"no_think": True},
+            task=self._chat_task(
+                prompt_chars, output_tokens=200,
+                quality_need=self._GENERATE_QUALITY,
+                budget_s=self._GENERATE_BUDGET_S),
+        )
+        if not submitted:
+            # Scheduler paused/absent — leave the message queued, retry later.
+            return None
+        self._turn = {"stage": "generate", "user_text": user_text,
+                      "source": source, "update_id": update_id}
+        return {"type": "chat_submitted", "source": source}
+
+    def _build_available_actions(self, user_text: str, history: str) -> str:
+        """Per-turn action docs: full cards relevant to this conversation plus
+        a one-line index of everything else this sender may use.
+
+        The capability profile filters *display* (an untrusted telegram
+        sender's prompt carries no trust/persona/python docs at all — smaller
+        injection surface); execution gating in _handle_action runs
+        regardless of what was shown.
+        """
+        try:
+            from action_registry import select_actions
+            from capabilities import chat_profile
+            profile = chat_profile(
+                self._trusted, local=self._is_trusted_source(self._sensor_name),
+            )
+            dynamic = {}
+            router = getattr(self.brain, 'llm_router', None)
+            if router is not None:
+                try:
+                    dynamic['llm_models'] = ", ".join(
+                        m['name'] for m in router._registry)
+                except Exception:
+                    pass
+            block = select_actions(
+                user_text, history=history, profile=profile, dynamic=dynamic,
+            )
+            return block or "(no actions available to this sender)"
+        except Exception as exc:
+            log.warning("Action card selection failed: %s", exc)
+            return "(action list unavailable this turn)"
+
+    def _ack_source_message(self, update_id: Optional[int]) -> None:
+        """Tell the originating cursor-based sensor (Telegram) that a message
+        is fully processed, so it can advance its acknowledgment and Telegram
+        can drop it.  No-op for sources without an update_id / mark_processed
+        (e.g. web chat).  This is what makes Telegram ingestion at-least-once:
+        the cursor advances only after the message is actually handled."""
+        if not update_id:
+            return
+        sensors = getattr(getattr(self, 'brain', None), 'sensors', None)
+        sensor = sensors.get(self._sensor_name) if isinstance(sensors, dict) else None
+        mark = getattr(sensor, 'mark_processed', None)
+        if callable(mark):
+            try:
+                mark([update_id])
+            except Exception as exc:
+                log.debug("UserChatStream: mark_processed failed: %s", exc)
+
+    def _chat_role(self) -> str:
+        """Web chat is local/admin — use the fast model so the heavy model stays
+        free for Telegram and subconscious streams.  Telegram uses 'chat'."""
+        return "fast" if self._is_trusted_source(self._sensor_name) else "chat"
+
+    # Interactive-chat SLAs the router scores models against (latency-budget
+    # routing, not just role): generate is a real reply (some quality needed);
+    # rephrase is a small transform of tool output (speed over quality).
+    _GENERATE_BUDGET_S = 8.0
+    _GENERATE_QUALITY = 0.45
+    _REPHRASE_BUDGET_S = 6.0
+    _REPHRASE_QUALITY = 0.3
+
+    def _chat_task(self, prompt_chars: int, *, output_tokens: int,
+                   quality_need: float, budget_s: float) -> Dict[str, Any]:
+        """Build the per-turn task spec the router uses to pick a model by
+        latency budget + quality, instead of falling back to the permissive
+        60s default.  A conscious turn is the user actively waiting (max
+        urgency); a subconscious one is lower priority."""
+        return {
+            "prompt_tokens": max(50, int(prompt_chars) // 4),  # ~4 chars/token
+            "expected_output_tokens": output_tokens,
+            "quality_need": quality_need,
+            "latency_budget_s": budget_s,
+            "urgency": 0.9 if self.is_conscious else 0.6,
+        }
+
+    def _on_llm_result(self, result, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Dispatch a completed stage to its handler."""
+        stage = (self._turn or {}).get("stage")
+        if stage == "generate":
+            return self._on_generate_result(result, context)
+        if stage == "rephrase":
+            return self._on_rephrase_result(result, context)
+        # No recorded turn for this result — stale; ignore.
+        self._turn = None
+        return None
+
+    def _on_generate_result(self, result, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Apply the reply: send it, report the interaction, then run any gated
+        ACTION (which may open a second 'rephrase' stage)."""
+        turn = self._turn or {}
+        user_text = turn.get("user_text", "")
+        source = turn.get("source", self._sensor_name or self.name)
+
+        if result.discarded:
+            # Turn cut off (cycle rotated across sleep).  Leave the message
+            # queued so it is reprocessed; reset turn state.
+            self._turn = None
+            return None
+
+        if not result.ok and self._generate_retries < self._MAX_GENERATE_RETRIES:
+            # Transient failure — typically the LLM server mid-restart
+            # (model_unavailable / connection exception / timeout), and
+            # llm_management usually has it back within seconds (seen live:
+            # fallback sent at 20:20:07, model up at 20:20:08).  Same
+            # contract as the discarded path: leave the message queued so
+            # the next tick rebuilds and resubmits the turn.  Budget-capped
+            # so a persistently dead LLM still gets an apology, not silence.
+            self._generate_retries += 1
+            self._turn = None
+            self.add_to_log(
+                f"Generate failed ({result.error}) — retrying "
+                f"({self._generate_retries}/{self._MAX_GENERATE_RETRIES})")
+            log.warning("UserChatStream: generate failed (%s) — retry %d/%d",
+                        result.error, self._generate_retries,
+                        self._MAX_GENERATE_RETRIES)
+            return None
+
+        # Commit: remove the message we processed (still at the front).
+        if self._pending_messages:
+            self._pending_messages.pop(0)
+        self._generate_retries = 0
+
+        if not result.ok:
+            response = self._fallback_message(result.error)
+            action = None
+            log.warning("UserChatStream: generate failed (%s)", result.error)
+        else:
+            response, action = self._extract_action(result.text)
 
         self.add_to_log(f"IYYE: {response}")
         self.add_output(response, target=source)
         if response:
             self._send_to_actuator(response, context)
         self._report_interaction(user_text, response)
+        self._mark_recall_used(user_text, response)
 
-        # When a trusted user mentions trusting/untrusting someone, update via ToM.
-        if self._trusted:
-            trust_feedback = self._detect_trust_change(user_text)
-            if trust_feedback:
-                self._send_to_actuator(trust_feedback, context)
+        # The message is now durably handled (reply sent / logged).  Ack it to
+        # the source sensor so Telegram advances its cursor and stops
+        # re-delivering — at-least-once: ack happens only after processing.
+        self._ack_source_message(turn.get("update_id"))
 
-        # Read-only research actions (wikipedia, url) are safe from any
-        # source.  Trust/untrust are self-authenticating (the LLM verifies
-        # the PIN before emitting the ACTION), so they must be allowed from
-        # untrusted sources — otherwise users can never become trusted.
-        # Only privileged actions (python, llm) require prior trust.
-        _SAFE_ACTION_TYPES = {'wikipedia', 'url', 'trust', 'untrust'}
-        if action and not self._trusted:
-            if action.get('type') not in _SAFE_ACTION_TYPES:
-                self.add_to_log(f"Suppressed ACTION from untrusted source {source}")
-                action = None
+        # Capability tier (HLD §9; issue #1): trust/untrust/persona are
+        # local-web-chat only; trusted Telegram gets python/llm; untrusted gets
+        # read-only lookups.  A PIN claim over Telegram never moves trust.
+        from capabilities import chat_profile
+        profile = chat_profile(
+            self._trusted, local=self._is_trusted_source(self._sensor_name),
+        )
+        if action and not profile.allows(action.get('type')):
+            self.add_to_log(
+                f"Suppressed '{action.get('type')}' ACTION from source {source} "
+                f"(profile={profile.name})"
+            )
+            action = None
 
         if action:
-            action_type = action.get('type')
-            if action_type == 'python':
-                # Execute inline — short subprocess, no need for a separate stream.
-                py_result = self._execute_python(action.get('code', ''), context)
+            staged = self._handle_action(action, user_text, context)
+            if staged is not None:
+                return staged  # a second LLM stage (rephrase) is now in flight
+
+        self._turn = None
+        return {"type": "chat_reply", "text": response, "source": source}
+
+    def _handle_action(
+        self, action: Dict[str, Any], user_text: str, context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Execute a gated ACTION.  Returns a non-None marker only when it has
+        submitted a follow-up LLM stage (python → rephrase) so the turn stays
+        open; otherwise returns None (turn complete)."""
+        action_type = action.get('type')
+        if action_type == 'python':
+            # Run the (≤30s) subprocess on its own thread so it never blocks the
+            # main loop.  execute() polls it via _poll_python and then submits
+            # the async 'rephrase' stage once it finishes.
+            code = action.get('code', '')
+            holder: Dict[str, Any] = {"output": None}
+
+            def _run_py(holder=holder, code=code, context=context):
+                holder["output"] = self._execute_python(code, context)
+
+            t = threading.Thread(target=_run_py, name=f"py_{self.name}", daemon=True)
+            self._background_threads = [x for x in self._background_threads if x.is_alive()]
+            self._background_threads.append(t)
+            self._turn = {"stage": "python_running", "user_text": user_text,
+                          "source": self._sensor_name or self.name,
+                          "py_thread": t, "py_holder": holder}
+            t.start()
+            return {"type": "chat_python_running"}
+        if action_type in ('trust', 'untrust'):
+            feedback = self._execute_trust_action(action)
+            if feedback:
+                self._send_to_actuator(feedback, context)
+            # Refresh cached trust (e.g. the owner just revoked a contact this
+            # stream serves).  Self-trust via the action is impossible —
+            # trust changes are local-web-chat only.
+            self._trusted = self._check_contact_trusted()
+        elif action_type == 'llm':
+            feedback = self._execute_llm_action(action)
+            if feedback:
+                self._send_to_actuator(feedback, context)
+        elif action_type == 'persona':
+            feedback = self._execute_persona_action(action)
+            if feedback:
+                self._send_to_actuator(feedback, context)
+        elif action_type == 'plan':
+            feedback = self._execute_plan_action(action)
+            if feedback:
+                self._send_to_actuator(feedback, context)
+        else:
+            action['chat_id'] = self._last_chat_id
+            action['sensor_name'] = self._sensor_name
+            action['sender_name'] = self._last_sender_name
+            # Carry the user's question so the research stream can phrase an
+            # answer (and never dump raw fetched HTML/JS at the user).
+            action['user_text'] = user_text
+            if not hasattr(self.brain, '_pending_research_tasks'):
+                self.brain._pending_research_tasks = []
+            self.brain._pending_research_tasks.append(action)
+            self.add_to_log(
+                f"Queued research task: {action_type} — "
+                f"{action.get('query') or action.get('url', '')[:60]}"
+            )
+        return None
+
+    def _poll_python(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Wait for the off-thread python subprocess, then submit the async
+        'rephrase' stage with its output (or send the raw output if rephrasing
+        can't be submitted)."""
+        turn = self._turn or {}
+        thread = turn.get("py_thread")
+        if thread is not None and thread.is_alive():
+            return None  # subprocess still running
+        py_result = (turn.get("py_holder") or {}).get("output") or "(no output)"
+        user_text = turn.get("user_text", "")
+        source = turn.get("source", self._sensor_name or self.name)
+        self.add_to_log(f"Python result: {py_result[:200]}")
+        rephrase_history = self._build_history() or "(none)"
+        tool_output = py_result[:self._REPHRASE_MAX_INPUT]
+        submitted = self._llm_submit(
+            role="fast",
+            kind=("chat_conscious" if self.is_conscious else "chat_subconscious"),
+            call=LLMCall.from_file(
+                "rephrase_tool_result",
+                user_message=user_text,
+                tool_output=tool_output,
+                conversation_history=rephrase_history,
+            ),
+            client_kwargs={"no_think": True},
+            task=self._chat_task(
+                len(user_text) + len(tool_output) + len(rephrase_history),
+                output_tokens=150, quality_need=self._REPHRASE_QUALITY,
+                budget_s=self._REPHRASE_BUDGET_S),
+        )
+        if submitted:
+            self._turn = {"stage": "rephrase", "user_text": user_text,
+                          "source": source, "py_result": py_result}
+            return {"type": "chat_tool_rephrasing"}
+        # Couldn't submit the rephrase — send the raw tool output rather than
+        # nothing.
+        self._send_to_actuator(py_result, context)
+        self._turn = None
+        return None
+
+    def _on_rephrase_result(self, result, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Send the rephrased tool answer (or the raw tool output as fallback)."""
+        turn = self._turn or {}
+        self._turn = None
+        source = turn.get("source", self._sensor_name or self.name)
+        py_result = turn.get("py_result", "")
+        if result.discarded:
+            # Lost the rephrase; send the raw tool output so the user still gets
+            # the answer (the main reply was already delivered).
+            if py_result:
                 self._send_to_actuator(py_result, context)
-                self.add_to_log(f"Python execution result: {py_result[:200]}")
-            elif action_type in ('trust', 'untrust'):
-                feedback = self._execute_trust_action(action)
-                if feedback:
-                    self._send_to_actuator(feedback, context)
-                # Re-evaluate own trust: the action may have granted trust
-                # to the current sender (self-trust via PIN verification).
-                self._trusted = self._check_contact_trusted()
-            elif action_type == 'llm':
-                feedback = self._execute_llm_action(action)
-                if feedback:
-                    self._send_to_actuator(feedback, context)
-            elif action_type == 'persona':
-                feedback = self._execute_persona_action(action)
-                if feedback:
-                    self._send_to_actuator(feedback, context)
-            else:
-                action['chat_id'] = self._last_chat_id
-                action['sensor_name'] = self._sensor_name
-                action['sender_name'] = self._last_sender_name
-                if not hasattr(self.brain, '_pending_research_tasks'):
-                    self.brain._pending_research_tasks = []
-                self.brain._pending_research_tasks.append(action)
-                self.add_to_log(f"Queued research task: {action_type} — {action.get('query') or action.get('url', '')[:60]}")
+            return None
+        text = result.text if (result.ok and result.text) else py_result
+        self.add_to_log(f"Rephrased: {text[:200]}")
+        if text:
+            self._send_to_actuator(text, context)
+        return {"type": "chat_reply", "text": text, "source": source}
 
-        self.checkpoint()
-
-        return {'type': 'chat_reply', 'text': response, 'source': source}
+    @staticmethod
+    def _fallback_message(error: Optional[str]) -> str:
+        """User-facing message when the generate stage failed (not discarded)."""
+        e = (error or "").lower()
+        if "timeout" in e:
+            return ("Sorry, that took longer than expected — the model may be "
+                    "overloaded. Please try again in a moment.")
+        # Connection-class exceptions mean the same thing as the scheduler's
+        # explicit model_unavailable: the server is down or mid-restart.
+        if any(kw in e for kw in ("model_unavailable", "connection",
+                                  "refused", "unreachable")):
+            return ("I'm briefly unable to reach my language model — it may be "
+                    "starting up. Please try again shortly.")
+        return "Sorry, I couldn't generate a response just now. Please try again."
 
     # ------------------------------------------------------------------
     # Helpers
@@ -549,11 +808,18 @@ class UserChatStream(ProcessingStream):
             if stripped.startswith("ACTION:"):
                 payload = stripped[len("ACTION:"):].strip()
                 try:
+                    # Valid types come from the action-card registry (single
+                    # source of truth — adding a card file adds the type);
+                    # registry falls back to a hardwired set if cards are
+                    # missing, so stripping never breaks.
+                    from action_registry import action_types
                     data = json.loads(payload)
-                    if isinstance(data, dict) and data.get('type') in ('wikipedia', 'url', 'python', 'trust', 'untrust', 'llm', 'persona'):
+                    if isinstance(data, dict) and data.get('type') in action_types():
                         action = data
                 except (json.JSONDecodeError, ValueError):
                     pass  # malformed — ignore, keep line as text
+                except Exception:
+                    pass  # registry failure — drop the action, keep chat alive
                 # Either way, don't include the ACTION line in visible response
                 continue
             clean_lines.append(line)
@@ -573,24 +839,36 @@ class UserChatStream(ProcessingStream):
             return "(unavailable)"
 
     def _build_ltm_context(self, query: str, limit: int = 8) -> str:
-        """Semantic search in LTM for facts relevant to the current message."""
-        memory = getattr(self.brain, 'memory', None)
-        if memory is None:
-            return "(none)"
+        """Relevant memory across LTM, STM, and Theory of Mind for this message.
+
+        Unified recall (recall.Recall) — one query path over all three stores,
+        with people *named in the query* pulling their ToM interaction history.
+        This is what lets "when did Jacob contact you?" find Jacob's history
+        (it lives in ToM) even though the sender is Alex and LTM has no fact."""
         try:
-            facts = memory.search_semantic(query, limit=limit)
+            from recall import Recall
+            results = Recall(self.brain).query(
+                query, limit=limit, sender=self._last_sender_name,
+            )
+            # Stash for usefulness attribution once the reply is produced
+            # (_on_generate_result) — the start of the retrieval-quality signal.
+            self._last_recall = results
+            return Recall.render(results)
         except Exception as exc:
-            log.warning("UserChatStream: LTM search failed: %s", exc)
-            return "(none)"
-        if not facts:
-            return "(none)"
-        lines = []
-        for f in facts:
-            tf = f.get('time_frame', '?')
-            conf = float(f.get('confidence', 0.5))
-            prov = f.get('provenance') or f.get('source') or '?'
-            lines.append(f"[{tf}/{conf:.2f} from {prov}] {f['text']}")
-        return "\n".join(lines)
+            self._last_recall = []
+            log.warning("UserChatStream: recall failed, falling back to LTM: %s", exc)
+            memory = getattr(self.brain, 'memory', None)
+            if memory is None:
+                return "(none)"
+            try:
+                facts = memory.search_semantic(query, limit=limit)
+            except Exception:
+                return "(none)"
+            return "\n".join(
+                f"[{f.get('time_frame','?')}/{float(f.get('confidence',0.5)):.2f}"
+                f" from {f.get('provenance') or f.get('source') or '?'}] {f['text']}"
+                for f in facts
+            ) or "(none)"
 
     def _build_stm_context(self) -> str:
         """Format non-ephemeral STM facts for injection into the LLM prompt."""
@@ -612,7 +890,7 @@ class UserChatStream(ProcessingStream):
 
     def _get_contact_context(self) -> str:
         """Query Theory of Mind stream for context about the current sender."""
-        tom = getattr(self.brain, '_tom_stream', None)
+        tom = self.brain.theory_of_mind()
         if tom is None:
             return "(unavailable)"
         contact_id = tom.make_contact_id(
@@ -622,76 +900,82 @@ class UserChatStream(ProcessingStream):
         ctx = tom.get_contact_context(contact_id)
         return ctx or "(new contact)"
 
+    def _mark_recall_used(self, user_text: str, response: str) -> None:
+        """Attribute which recalled facts the reply leaned on and record it
+        (#5 retrieval-quality signal, shadow only).  When facts were used,
+        arm a pending feedback for the next turn (did the reply satisfy the
+        user?).  Best-effort; clears the stash so it can't leak forward."""
+        recalled = getattr(self, '_last_recall', None)
+        self._last_recall = []
+        if not recalled:
+            return
+        try:
+            from recall import Recall
+            used = Recall.attribute(recalled, response)
+            Recall(self.brain).mark_used(used)
+            if used:
+                qid = next((r.query_id for r in used if r.query_id), None)
+                if qid:
+                    self._pending_feedback = {"query_id": qid,
+                                              "prev_user": user_text}
+        except Exception as exc:
+            log.debug("UserChatStream: recall usefulness marking failed: %s", exc)
+
+    # First-person correction openers signalling the prior answer missed.
+    _CORRECTION_RE = re.compile(
+        r"^(no\b|nope\b|wrong\b|that'?s (?:not|wrong)|not (?:what|quite|right)|"
+        r"actually\b|i meant\b|that'?s incorrect)", re.IGNORECASE)
+
+    def _emit_recall_feedback(self, new_user_text: str) -> None:
+        """Implicit feedback on the previous fact-using turn, read from the
+        next message: a correction or a re-ask means dissatisfied, otherwise
+        satisfied.  Shadow only — journaled as `recall_feedback`, joined to the
+        recall by query_id; the usefulness pass (#5 B/C) decides how to weigh
+        used-and-satisfied vs used-and-dissatisfied.  Coarse by design."""
+        pending = getattr(self, '_pending_feedback', None)
+        self._pending_feedback = None
+        if not pending:
+            return
+        prev = pending.get("prev_user", "")
+        low = (new_user_text or "").strip()
+        dissatisfied = bool(self._CORRECTION_RE.match(low)) or \
+            self._reask_overlap(prev, new_user_text) >= 0.6
+        try:
+            from event_journal import emit
+            emit(getattr(self.brain, "journal", None), "recall_feedback",
+                 query_id=pending.get("query_id"),
+                 signal="dissatisfied" if dissatisfied else "satisfied")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _reask_overlap(a: str, b: str) -> float:
+        ta = frozenset(w for w in re.findall(r"[a-z0-9]+", (a or "").lower()) if len(w) > 2)
+        tb = frozenset(w for w in re.findall(r"[a-z0-9]+", (b or "").lower()) if len(w) > 2)
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / len(ta | tb)
+
     def _report_interaction(self, user_text: str, response: str) -> None:
         """Post this interaction to Theory of Mind via mailbox."""
-        tom = getattr(self.brain, '_tom_stream', None)
+        tom = self.brain.theory_of_mind()
         if tom is None:
             return
         contact_id = tom.make_contact_id(
             self._last_sender_name, self._sensor_name,
             self._last_chat_id, self._last_user_id,
         )
-        self.brain.post_message("theory_of_mind", {
-            "action": "interaction",
-            "contact_id": contact_id,
-            "display_name": self._last_sender_name,
-            "source": self._sensor_name,
-            "chat_id": self._last_chat_id,
-            "user_id": self._last_user_id,
-            "user_said": user_text,
-            "iyye_said": response,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-
-    def _generate_response(
-        self,
-        user_text: str,
-        source: str,
-        sender_name: Optional[str],
-        conversation_history: str,
-        stm_facts: str = "(none)",
-        ltm_facts: str = "(none)",
-        adenosine: float = 1.0,
-        active_streams: int = 0,
-        sr_snapshot: Optional[Dict[str, Any]] = None,
-        system_description: str = "(unavailable)",
-        contact_context: str = "(unavailable)",
-        context: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        llm = self._get_llm()
-        if llm is None:
-            return f"[Iyye offline] Echo: {user_text}"
-
-        # Send a typing indicator so the user knows a response is being
-        # generated — large models can take minutes.
-        if context is not None:
-            self._send_typing_indicator(context)
-
-        system_state = self._build_system_state(adenosine, active_streams, sr_snapshot)
-        sender_label = sender_name or "unknown"
-        try:
-            return llm.complete_from_file(
-                "chat_response",
-                user_message=user_text,
-                source=source,
-                sender_name=sender_label,
-                conversation_history=conversation_history or "(none)",
-                stm_facts=stm_facts,
-                ltm_facts=ltm_facts,
-                system_state=system_state,
-                system_description=system_description,
-                contact_context=contact_context,
-            )
-        except Exception as exc:
-            exc_name = type(exc).__name__
-            log.error("UserChatStream LLM error (%s): %s", exc_name, exc)
-            # Surface a short user-visible message rather than a raw traceback.
-            if "timeout" in exc_name.lower() or "timeout" in str(exc).lower():
-                return (
-                    "Sorry, the response is taking longer than expected. "
-                    "The model may be overloaded — please try again in a moment."
-                )
-            return f"[Iyye error] Could not generate response ({exc_name})"
+        from messaging import Messages
+        self.brain.post_message("theory_of_mind", Messages.interaction(
+            contact_id=contact_id,
+            display_name=self._last_sender_name,
+            source=self._sensor_name,
+            chat_id=self._last_chat_id,
+            user_id=self._last_user_id,
+            user_said=user_text,
+            iyye_said=response,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
 
     @staticmethod
     def _build_system_state(
@@ -740,7 +1024,7 @@ class UserChatStream(ProcessingStream):
         # Supplement with cross-channel history from ToM when own is thin.
         own_pairs = min(len(inputs), len(outputs))
         if own_pairs < _HISTORY_CAP:
-            tom = getattr(self.brain, '_tom_stream', None)
+            tom = self.brain.theory_of_mind()
             if tom is not None:
                 contact_id = tom.make_contact_id(
                     self._last_sender_name, self._sensor_name,
@@ -765,6 +1049,14 @@ class UserChatStream(ProcessingStream):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # Tool-result rephrasing
+    # ------------------------------------------------------------------
+
+    # Max chars of raw tool output fed to the async 'rephrase' stage
+    # (see _handle_action).
+    _REPHRASE_MAX_INPUT = 3000
+
+    # ------------------------------------------------------------------
     # Python execution (HLD: privileged users have access to python interpreter)
     # ------------------------------------------------------------------
 
@@ -772,7 +1064,28 @@ class UserChatStream(ProcessingStream):
     _PYTHON_MAX_LINES = 100  # max lines in a submitted script
     _PYTHON_MAX_OUTPUT = 4000  # max chars of captured output
 
+    # Transient generate failures (LLM restarting) retried per message before
+    # the user gets a fallback apology.  Each failed attempt already takes
+    # seconds (health check / timeout), which acts as natural backoff.
+    _MAX_GENERATE_RETRIES = 2
+
     def _execute_python(self, code: str, context: Dict[str, Any]) -> str:
+        """Run a Python script and journal the execution (Phase 0 causal record).
+
+        Thin wrapper over :meth:`_run_python_code` so every return path — and
+        the generated script itself, which is deleted after the run — is
+        captured in the journal.  This is the script-archive that was missing
+        when the stock-price subprocess silently failed: code + output, keyed
+        by stream, recoverable for debugging and replay.
+        """
+        result = self._run_python_code(code, context)
+        from event_journal import emit, clip
+        emit(getattr(self.brain, 'journal', None), "tool_exec",
+             stream=self.name, kind="python",
+             code=clip(code), output=clip(result))
+        return result
+
+    def _run_python_code(self, code: str, context: Dict[str, Any]) -> str:
         """Run a Python script in a subprocess and return the captured output.
 
         HLD §9: "privileged users have access to all tools including python
@@ -834,28 +1147,37 @@ class UserChatStream(ProcessingStream):
                 pass
 
     def _send_typing_indicator(self, context: Dict[str, Any]) -> None:
-        """Notify the user that a response is being generated.
+        """Notify a Telegram user that a response is being generated.
 
-        For Telegram: sends the "typing..." chat action so the user sees
-        the animated dots.  For web chat: sends a brief status message.
-        This is best-effort — failures are silently ignored.
+        Sends the "typing…" chat action.  The HTTP POST runs on a daemon thread
+        so it never blocks the main loop (it has a 5s timeout, which previously
+        stalled every Telegram turn).  Best-effort: failures are ignored.
+        Web chat needs no indicator (fast model, quick responses).
         """
-        try:
-            if 'telegram' in self._sensor_name.lower() and self._last_chat_id:
-                import os, requests as _req
-                token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-                if token:
-                    _req.post(
-                        f"https://api.telegram.org/bot{token}/sendChatAction",
-                        json={"chat_id": self._last_chat_id, "action": "typing"},
-                        timeout=5,
-                    )
-            else:
-                # Web chat uses the fast model — responses are quick enough
-                # that a typing indicator would just add noise to the chat.
-                pass
-        except Exception:
-            pass  # best-effort
+        if 'telegram' not in self._sensor_name.lower() or not self._last_chat_id:
+            return
+        import os
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        if not token:
+            return
+        chat_id = self._last_chat_id
+
+        def _post(token=token, chat_id=chat_id):
+            try:
+                import requests as _req
+                _req.post(
+                    f"https://api.telegram.org/bot{token}/sendChatAction",
+                    json={"chat_id": chat_id, "action": "typing"},
+                    timeout=5,
+                )
+            except Exception:
+                pass  # best-effort
+
+        t = threading.Thread(target=_post, name=f"typing_{self.name}", daemon=True)
+        # Track (pruning finished ones) so wind-down's settle() can bound-join it.
+        self._background_threads = [x for x in self._background_threads if x.is_alive()]
+        self._background_threads.append(t)
+        t.start()
 
     def _send_to_actuator(self, response: str, context: Dict[str, Any]) -> None:
         """Route response to the actuator matching this stream's sensor source."""
@@ -882,6 +1204,7 @@ class UserChatStream(ProcessingStream):
         if not candidates:
             candidates = list(actuators.keys())[:1]
 
+        from iyye_base import ACTUATE_SUPPRESSED
         for actuator_name in candidates:
             actuator = actuators[actuator_name]
             try:
@@ -890,7 +1213,17 @@ class UserChatStream(ProcessingStream):
                     payload = json.dumps({'text': response, 'chat_id': self._last_chat_id})
                 else:
                     payload = response
-                ok = actuator.actuate(payload)
+                # allow_duplicate: a user-visible reply must never be dropped as
+                # a "duplicate" (e.g. the same answer to a repeated question) —
+                # the raw-data safety net still applies.
+                ok = actuator.actuate(payload, allow_duplicate=True)
+                if ok is ACTUATE_SUPPRESSED:
+                    # A guardrail (raw-data net) blocked it — NOT delivered.
+                    # Don't claim success; try the next candidate.
+                    log.warning("Actuator %s suppressed the reply (guardrail) — "
+                                "not delivered", actuator_name)
+                    self.add_to_log(f"Reply blocked by {actuator_name} guardrail (not sent)")
+                    continue
                 if ok is False:
                     # Explicit False means a known failure (e.g. missing chat_id,
                     # bot send error).  Try the next candidate rather than silently

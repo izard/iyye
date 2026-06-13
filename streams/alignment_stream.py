@@ -136,6 +136,11 @@ class AlignmentStream(LLMConsumerMixin, ProcessingStream):
                         streams_snapshot=json.dumps(snapshots, indent=2),
                     ),
                     client_kwargs={"no_think": True, "max_tokens": 512},
+                    # Background scoring: very latency-insensitive — keep it off
+                    # the interactive models entirely.
+                    task={"prompt_tokens": 800, "expected_output_tokens": 400,
+                          "quality_need": 0.4, "latency_budget_s": 120,
+                          "urgency": 0.1},
                 )
 
         # Build the returned scores: cached batch scores + keyword fallback for
@@ -150,7 +155,44 @@ class AlignmentStream(LLMConsumerMixin, ProcessingStream):
 
         # Apply scores through the brain (owner), not by mutating peers.
         self.brain.record_alignment(results)
+
+        # HLD: "Plan priority is recomputed by the alignment stream each
+        # cycle."  Derive per-goal need from the scores just produced and let
+        # the plan store reprice every live plan against it.
+        self._recompute_plan_priorities(results)
         return results
+
+    def _recompute_plan_priorities(
+        self, results: Dict[str, Dict[str, float]],
+    ) -> None:
+        """Reprice long term plans from the current motivation state.
+
+        goal_need(g) = 1 - best score on g across live streams: a goal no
+        running stream serves is fully "needy" (1.0), a goal some stream
+        already serves well contributes little — so plans gain priority
+        exactly when the motivation system lacks coverage, and lose it when
+        ordinary stream activity already covers their goals.
+        """
+        store = getattr(self.brain, "plan_store", None)
+        if store is None:
+            return
+        goal_needs = {
+            goal: 1.0 - max(
+                (scores.get(goal, 0.0) for scores in results.values()),
+                default=0.0,
+            )
+            for goal in self.GOALS
+        }
+        try:
+            changed = store.recompute_priorities(goal_needs)
+        except Exception as exc:
+            log.warning("AlignmentStream: plan priority recompute failed: %s", exc)
+            return
+        if changed:
+            self.add_to_log(
+                f"Repriced {changed} plan(s) from goal needs "
+                + ", ".join(f"{g}={n:.2f}" for g, n in goal_needs.items())
+            )
 
     def _parse_batch_scores(self, raw: str) -> Optional[Dict[str, Dict[str, float]]]:
         """Parse the batch LLM response ``{stream_name: {goal: score}}``."""
