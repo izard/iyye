@@ -2295,6 +2295,94 @@ class IyyeBrain:
                 len(self._jreplay_fact_activity), len(self._jreplay_promoted),
                 len(self._jreplay_extracted),
             )
+        # Retry promotions that failed in PRIOR cycles.  The journal rotates and
+        # old STM is pruned, so the failed fact would otherwise never be
+        # revisited — the durable retry queue is the only thing that survives
+        # both (issue: failed promotion retained but never retried).
+        self._retry_failed_promotions()
+
+    # ------------------------------------------------------------------ #
+    # Durable promotion retry queue (survives cycle rotation + STM pruning)
+    # ------------------------------------------------------------------ #
+    _PROMOTION_RETRY_PATH = PROJECT_ROOT / "journal" / "promotion_retry.json"
+
+    def _load_promotion_retry(self) -> List[Dict[str, Any]]:
+        try:
+            if self._PROMOTION_RETRY_PATH.exists():
+                data = json.loads(self._PROMOTION_RETRY_PATH.read_text())
+                if isinstance(data, list):
+                    return data
+        except Exception as exc:
+            log.warning("Could not load promotion retry queue: %s", exc)
+        return []
+
+    def _persist_promotion_retry(self, items: List[Dict[str, Any]]) -> bool:
+        """Atomically persist the retry queue; return True on a durable write.
+
+        The queue holds ONLY unresolved promotions (resolved ones are removed
+        in _retry_failed_promotions), so it must never be truncated — dropping
+        an entry loses a fact.  It is self-limiting: each fact is enqueued once
+        (dedup) and removed once promoted, so its size is bounded by facts
+        created during an LTM outage."""
+        try:
+            self._PROMOTION_RETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._PROMOTION_RETRY_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(items))
+            tmp.replace(self._PROMOTION_RETRY_PATH)
+            return True
+        except Exception as exc:
+            log.warning("Could not persist promotion retry queue: %s", exc)
+            return False
+
+    def _enqueue_promotion_retry(
+        self, fid: str, fact: Dict[str, Any], entry: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Durably record a promotion that failed transiently, so a later
+        replay retries it even after the journal/STM that held it is gone.
+        Returns True only when the retry is durably recorded (already present,
+        or successfully written) — the caller must not advance past the failed
+        event otherwise, or the fact (kept only in soon-pruned STM) is stranded."""
+        q = self._load_promotion_retry()
+        if any(item.get('fid') == fid for item in q):
+            return True   # already durably queued
+        q.append({'fid': fid, 'fact': fact, 'entry': entry})
+        return self._persist_promotion_retry(q)
+
+    def _retry_failed_promotions(self) -> None:
+        """Re-attempt every queued failed promotion; keep the ones that still
+        fail, drop the rest (promoted or now intentionally filtered).  Runs at
+        replay init, before the current cycle's events, so transient LTM
+        outages eventually resolve without any data loss."""
+        q = self._load_promotion_retry()
+        if not q:
+            return
+        remaining: List[Dict[str, Any]] = []
+        for item in q:
+            fid = item.get('fid')
+            fact = item.get('fact') or {}
+            result = self._promote_stm_to_ltm(fact, item.get('entry'))
+            if result is None:
+                remaining.append(item)   # still failing — keep for next time
+                continue
+            if fid:
+                self._jreplay_promoted.add(fid)
+            if result != self._PROMOTE_FILTERED:
+                self._jreplay_discovered.append(
+                    {'id': result, 'text': fact.get('text', '')})
+                if getattr(self, 'journal', None) is not None:
+                    self.journal.append('ltm_promotion', ltm_id=result,
+                                        fact_id=fid, src_seq=None,
+                                        text=fact.get('text', '')[:200])
+            # Drop the now-promoted/filtered STM copy if it is still around.
+            if fid and getattr(self, 'stm', None) is not None:
+                try:
+                    self.stm.remove_by_ids([fid])
+                except Exception:
+                    pass
+        if len(remaining) != len(q):
+            log.info("Promotion retry: %d/%d resolved, %d still pending",
+                     len(q) - len(remaining), len(q), len(remaining))
+        self._persist_promotion_retry(remaining)
 
     def _replay_activity_extractable(
         self, stream_name: str, text: str,
@@ -2358,11 +2446,22 @@ class IyyeBrain:
                     result = self._promote_stm_to_ltm(fact, entry)
                     if result is None:
                         # Transient LTM failure — keep the STM fact (do NOT add
-                        # to step_removed) and leave it unmarked so a restart or
-                        # later pass retries it.  Never delete the only copy of a
-                        # fact whose promotion failed (HLD: promote then delete).
-                        log.warning("Replay: promotion failed for %s — keeping "
-                                    "STM fact for retry", fid)
+                        # to step_removed) and durably enqueue the promotion so
+                        # it is revisited after this journal rotates and the STM
+                        # copy is pruned.
+                        if self._enqueue_promotion_retry(fid, fact, entry):
+                            # Safely deferred — advance so one stuck fact can't
+                            # starve the rest of the cycle's extraction.
+                            log.warning("Replay: promotion failed for %s — kept "
+                                        "STM fact and queued for retry", fid)
+                        else:
+                            # Could not durably record the retry.  Do NOT advance
+                            # or rotate past it: leave the cursor here so replay
+                            # re-attempts next tick.  Otherwise the only copy is
+                            # the STM fact, pruned within days → permanent loss.
+                            log.error("Replay: promotion AND retry-enqueue failed "
+                                      "for %s — pausing replay (no rotate)", fid)
+                            break  # cursor left at this event (set after loop)
                     else:
                         # Promoted (id) or intentionally filtered — either way the
                         # STM copy is now safe to delete.
