@@ -566,12 +566,148 @@ class SelfReflectionStream(LLMConsumerMixin, ProcessingStream):
         r"set\s+up|follow\s+up|dig\s+into)\b",
         re.IGNORECASE)
 
+    # Prompt self-improvement (#6): fold per-version outcomes from the journal
+    # and let the registry promote/roll back a trialled prompt rewrite.  The
+    # fold + select are side-effect-light (no-ops until a trial exists);
+    # proposing a new candidate (which changes what serves traffic) is gated
+    # behind _PROMPT_TRIAL_APPLY — shadow-first, like attention tuning.
+    _PROMPT_TRIAL_APPLY = False
+
     def sleep_phases(self) -> List[SleepPhase]:
         # Order 65: before replay (70) consolidates/clears STM, so the day's
         # promise facts are still present for the dedup check.
-        return [SleepPhase(
-            "promise_backstop", lambda brain: self._sleep_promise_backstop(), 65,
-        )]
+        return [
+            SleepPhase("promise_backstop",
+                       lambda brain: self._sleep_promise_backstop(), 65),
+            # Order 77: after attention tuning (76), before cleanup (80).
+            SleepPhase("prompt_tuning",
+                       lambda brain: self._sleep_prompt_tuning(), 77),
+        ]
+
+    def _sleep_prompt_tuning(self) -> bool:
+        """Attribute this cycle's LLM outcomes to the prompt version that served
+        each job, accumulate per-version reward in the registry, and evaluate
+        any running prompt trial (promote on a margin win, roll back if it
+        fails to beat the baseline).
+
+        Reward is a robust, prompt-agnostic success signal: a job whose result
+        landed ``ok`` and was not discarded scored the prompt's job as good;
+        a failed/discarded result (the "Sorry, I couldn't generate a response"
+        class of incident) scores it bad.  Exact attribution uses the
+        ``prompt_version`` journaled on the matching ``llm_submit``."""
+        journal = getattr(self.brain, "journal", None)
+        # The cycle consolidated this sleep, captured before replay rotated the
+        # journal — see IyyeBrain._enter_asleep.  Reading the live cycle_id here
+        # (post-rotation) would fold the empty next partition.
+        cycle = getattr(self.brain, "_consolidating_cycle", None)
+        if cycle is None and journal is not None:
+            cycle = getattr(journal, "cycle_id", None)
+        if journal is None or cycle is None:
+            return True
+        try:
+            from prompt_registry import get_registry, fold_outcomes
+            events = journal.read_cycle(
+                cycle, types=frozenset({"llm_submit", "llm_result"}))
+        except Exception as exc:
+            log.debug("Prompt tuning: read failed: %s", exc)
+            return True
+
+        reg = get_registry()
+        counts = fold_outcomes(reg, events)
+
+        from event_journal import emit
+        for name, c in counts.items():
+            decision = reg.select(name) if reg.status(name).get("trial") else None
+            mean = c["sum"] / c["n"] if c["n"] else 0.0
+            emit(journal, "prompt_tuning", name=name,
+                 version=reg.active_version_id(name), n=int(c["n"]),
+                 mean_reward=round(mean, 3), decision=decision)
+            if decision:
+                self.add_to_log(f"Prompt '{name}': {decision}")
+
+        # Act phase (gated): when no trial is running, propose one rewrite of
+        # the worst eligible prompt and trial it.  Shadow-first — disabled until
+        # the per-version reward signal above is validated over real cycles.
+        if self._PROMPT_TRIAL_APPLY:
+            self._propose_prompt_candidate(reg, journal)
+        return True
+
+    def _propose_prompt_candidate(self, reg, journal) -> None:
+        """Pick the worst-performing eligible prompt, ask a quality LLM to
+        rewrite it, validate the rewrite, and start a trial.  Best-effort: any
+        failure (no eligible prompt, no client, invalid rewrite) is a no-op."""
+        from prompt_registry import (select_prompt_to_improve, validate_candidate)
+        from event_journal import emit
+        name = select_prompt_to_improve(reg, reg.tracked_names())
+        if not name:
+            return
+        base = reg.status(name).get("versions", {}).get("base", {})
+        n = base.get("n", 0)
+        success_rate = (base.get("sum_reward", 0.0) / n) if n else 0.0
+        try:
+            from llm_client import _load_prompt
+            current = _load_prompt(name)              # the serving base content
+            template = _load_prompt("prompt_rewrite")  # the meta-prompt
+        except Exception as exc:
+            log.debug("Prompt rewrite: load failed: %s", exc)
+            return
+        import re as _re
+        placeholders = ", ".join(sorted("{%s}" % p for p in
+                                        _re.findall(r"{(\w+)}", current))) or "(none)"
+        # Literal-token substitution (NOT str.format): the embedded prompt keeps
+        # its own {placeholders} verbatim for the validator to match against.
+        filled = (template
+                  .replace("<<prompt_name>>", name)
+                  .replace("<<success_rate>>", f"{success_rate:.0%}")
+                  .replace("<<placeholders>>", placeholders)
+                  .replace("<<current_prompt>>", current))
+        client = self._improve_client()
+        if client is None:
+            return
+        try:
+            raw = client.complete(filled)
+        except Exception as exc:
+            log.debug("Prompt rewrite: LLM call failed: %s", exc)
+            return
+        candidate = self._strip_fences(raw)
+        ok, reason = validate_candidate(current, candidate)
+        emit(journal, "prompt_proposed", name=name,
+             success_rate=round(success_rate, 3), accepted=ok, reason=reason)
+        if not ok:
+            self.add_to_log(f"Prompt rewrite for '{name}' rejected: {reason}")
+            return
+        vid = reg.start_trial(name, candidate)
+        if vid:
+            self.add_to_log(
+                f"Trialling rewritten prompt '{name}' as {vid} "
+                f"(baseline success {success_rate:.0%})")
+
+    @staticmethod
+    def _strip_fences(text: str) -> str:
+        """Drop a leading/trailing markdown code fence the model may have added."""
+        t = (text or "").strip()
+        if t.startswith("```"):
+            t = t.split("\n", 1)[1] if "\n" in t else ""
+            if t.rstrip().endswith("```"):
+                t = t.rstrip()[:-3]
+        return t.strip()
+
+    def _improve_client(self):
+        """A quality-biased synchronous client for prompt rewriting, routed
+        through the LLM manager when available, else a bare client."""
+        router = getattr(self.brain, "llm_router", None)
+        if router is not None:
+            try:
+                return router.get_client(role="reasoning", task={
+                    "quality_need": 0.8, "latency_budget_s": 60, "urgency": 0.1})
+            except Exception as exc:
+                log.debug("Prompt rewrite: router client failed (%s)", exc)
+        try:
+            from llm_client import LLMClient
+            return LLMClient()
+        except Exception as exc:
+            log.debug("Prompt rewrite: no client (%s)", exc)
+            return None
 
     def _sleep_promise_backstop(self) -> bool:
         """Scan this cycle's outward chat replies for commitment language and,
