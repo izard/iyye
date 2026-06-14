@@ -70,3 +70,35 @@ def should_skip_stream(name: str) -> bool:
     if any(lower.startswith(p) for p in SKIP_STREAM_PREFIXES):
         return True
     return any(kw in lower for kw in SKIP_STREAM_KEYWORDS)
+
+
+def provenance_names_stream(provenance: str, stream: str) -> bool:
+    """True when an STM fact's *provenance* identifies it as written by *stream*.
+
+    Used by sleep replay to pair a fact with an activity-log entry only when
+    they come from the SAME stream — so an unrelated fact that merely happened
+    to be written near another stream's activity (plain temporal adjacency) is
+    never fed into that activity's fact extraction as "context", where it could
+    seed a durable but unsupported conclusion.
+
+    A fact's provenance is the stream's own identity for stream-written facts
+    (e.g. ``theory_of_mind``, ``plan_suggested_hardware_sensor_3``,
+    ``gen_graduated:<name>``), possibly merged as a comma/semicolon list.  A
+    provenance that is a semantic role rather than a stream (``USER``, ``Alex``,
+    ``ACTION``) does not name a stream and is left unpaired — conservatively, we
+    only enrich extraction with facts we can confirm share its origin."""
+    if not provenance or not stream:
+        return False
+    s = stream.strip().lower()
+    if not s:
+        return False
+    for seg in re.split(r"[,;]", provenance.lower()):
+        seg = seg.strip()
+        if seg.startswith("gen_graduated:"):
+            seg = seg.split(":", 1)[1].strip()
+        # The leading identifier of the segment (drop trailing detail like
+        # "(at ...)" or " at <ts>").
+        seg_id = re.split(r"[\s(]", seg, 1)[0].strip()
+        if seg == s or seg_id == s:
+            return True
+    return False

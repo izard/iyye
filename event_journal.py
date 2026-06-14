@@ -40,7 +40,11 @@ record so a recorded cycle can later be replayed/asserted:
 
 * ``tick``        {"tick","state","conscious"}              — one logical tick of the loop
 * ``llm_submit``  {"job_id","stream","kind","role",
-                   "conscious","prompt"}                    — an async LLM job was enqueued
+                   "conscious","prompt","prompt_name",
+                   "prompt_version"}                        — an async LLM job was enqueued
+                                                              (``prompt_version`` is the serving prompt
+                                                              version, "base" or a learned vid — the
+                                                              per-version reward key for #6 prompt tuning)
 * ``llm_result``  {"job_id","stream","ok","error","model",
                    "latency_s","discarded","text"}          — that job resolved (raw response)
 * ``tool_exec``   {"stream","kind","code","output"}         — a tool ran (e.g. python subprocess)
@@ -62,6 +66,37 @@ record so a recorded cycle can later be replayed/asserted:
                     "escalated","lifecycle"}                 — dreaming replanned a plan's pending steps
 * ``plan_resolved`` {"plan_id","verdict","reason"}          — dreaming judged the goal achieved/moot
                                                               (suspended for owner confirmation)
+* ``attention_decision`` {"stream","score","features",
+                          "weights"}                        — attention promoted a stream (the feature
+                                                              vector + weights behind the decision)
+* ``attention_tuning``   {"old","proposed","n",
+                          "mean_reward","applied"}          — sleep feedback loop's per-cycle weight
+                                                              adjustment (#4; shadow until applied)
+* ``prompt_tuning``      {"name","version","n",
+                          "mean_reward","decision"}         — sleep self-improvement of a prompt: per-
+                                                              version success rate this cycle and any
+                                                              promote/rollback of a running prompt trial
+                                                              (#6; ``prompt_version`` on llm_submit is the
+                                                              attribution key)
+* ``prompt_proposed``    {"name","success_rate",
+                          "accepted","reason"}              — the gated act phase proposed an LLM rewrite
+                                                              of an underperforming prompt; ``accepted``
+                                                              records whether it passed validation and
+                                                              became a trial (#6)
+* ``memory_decay``       {"fact_id","old","new",
+                          "time_frame","retrieved","used",
+                          "applied"}                        — sleep LTM hygiene down-weighted a fact from
+                                                              age-vs-durability + recall usefulness
+* ``memory_prune_candidate`` {"fact_id","time_frame",
+                          "age_days","decayed","retrieved",
+                          "used","applied"}                 — a non-durable, aged-out, unused fact eligible
+                                                              for deletion (``applied`` gated)
+* ``memory_superseded``  {"winner","loser","applied"}      — two facts judged to contradict; the loser
+                                                              (lower durability/recency/confidence) retired
+* ``memory_maintenance`` {"scanned","decayed",
+                          "prune_candidates","pruned",
+                          "superseded", ...applied flags}   — per-sleep summary of the maintenance pass
+                                                              (decay/prune/supersede; shadow until gated on)
 
 Sleep replay is made restart-safe by these events rather than a saved cursor:
 on a cold start it rebuilds progress from ``stm_remove`` (every STM fact it

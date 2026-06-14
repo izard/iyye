@@ -42,13 +42,38 @@ log = logging.getLogger("Iyye.LLM")
 _PROMPTS_DIR = PROJECT_ROOT / "prompts"
 
 
+def _strip_frontmatter(raw: str) -> str:
+    """Drop a leading YAML frontmatter block (--- ... ---)."""
+    return re.sub(r"^---\n.*?\n---\n", "", raw, flags=re.DOTALL).strip()
+
+
 def _load_prompt(name: str) -> str:
-    """Load a prompt template from prompts/<name>.md, stripping the YAML frontmatter."""
-    path = _PROMPTS_DIR / f"{name}.md"
-    raw = path.read_text(encoding="utf-8")
-    # Strip YAML frontmatter (--- ... ---)
-    stripped = re.sub(r"^---\n.*?\n---\n", "", raw, flags=re.DOTALL)
-    return stripped.strip()
+    """Load a prompt template, resolving through the version registry first.
+
+    Default behaviour is unchanged: with no registered non-base version, the
+    registry returns None and we load the shipped ``prompts/<name>.md`` file.
+    When a learned version is active, its content is used instead — letting the
+    sleep self-improvement pass trial prompt rewrites (gap #6) without any call
+    site change."""
+    try:
+        from prompt_registry import get_registry
+        active = get_registry().active_content(name)
+        if active is not None:
+            return _strip_frontmatter(active)
+    except Exception:
+        pass  # registry must never break prompt loading
+    raw = (_PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
+    return _strip_frontmatter(raw)
+
+
+def active_prompt_version(name: str) -> str:
+    """Version id serving *name* right now ("base" or a learned vid) — for
+    journaling so outcomes can be attributed to the version that produced them."""
+    try:
+        from prompt_registry import get_registry
+        return get_registry().active_version_id(name)
+    except Exception:
+        return "base"
 
 
 class LLMClient:

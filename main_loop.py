@@ -42,6 +42,7 @@ from memory_filters import (
     SKIP_STREAM_NAMES as _REPLAY_SKIP_LLM,
     SKIP_STREAM_PREFIXES as _REPLAY_SKIP_PREFIXES,
     SKIP_STREAM_KEYWORDS as _REPLAY_SKIP_KEYWORDS,
+    provenance_names_stream as _provenance_names_stream,
 )
 
 # LTM-specific noise filter — kept here because it is only used during
@@ -119,7 +120,15 @@ _LTM_NOISE_RE = re.compile(
     r'|\bwithout\s+further\s+deliberation\b'
     r'|\btransition\s+from\s+(?:internal\s+)?processing\s+to\s+external\s+impact\b'
     r'|\bconvert(?:ing)?\s+thought\s+into\s+(?:real|measurable|tangible)\b'
-    r'|\bpotentiality\s+to\s+actuality\b',
+    r'|\bpotentiality\s+to\s+actuality\b'
+    # Extraction-meta: the model narrating the extraction task instead of
+    # emitting a fact (e.g. "unable to find any meaningful facts in the
+    # provided activity log. No output required according to rules.").
+    r'|\bunable\s+to\s+(?:find|extract|identify|locate)\b'
+    r'|\b(?:no|any|without)\s+(?:meaningful|relevant|notable|significant|new)\s+facts?\b'
+    r'|\bno\s+output\s+(?:is\s+)?(?:required|needed|necessary|expected)\b'
+    r'|\baccording\s+to\s+(?:the\s+)?rules\b'
+    r'|\bprovided\s+activity\s+log\b',
     re.IGNORECASE,
 )
 
@@ -1517,6 +1526,14 @@ class IyyeBrain:
 
     def _enter_asleep(self) -> None:
         """Return to ASLEEP state and prepare streams for the next wake cycle."""
+        # Capture the cycle being consolidated this sleep BEFORE replay rotates
+        # the journal (_rotate_journal_cycle advances _journal_cycle to a fresh
+        # empty partition).  Sleep phases that fold "this cycle's" journal
+        # (attention_tuning, prompt_tuning, memory_maintenance) must read this
+        # id, not the live _journal_cycle — otherwise, running after replay,
+        # they would read the empty new partition.  The old partition survives
+        # on disk until cleanup prunes it, so a later-ordered phase still reads it.
+        self._consolidating_cycle = getattr(self, "_journal_cycle", 0)
         self._save_iyye_state()  # persist registry before sleeping
         REFILL_RATE = 0.05
         if hasattr(self.adenosine, "level"):
@@ -1912,8 +1929,26 @@ class IyyeBrain:
             SleepPhase("stm_flush", lambda b: b._sleep_phase_stm_flush(), 20),
             SleepPhase("prewarm",   lambda b: b._sleep_phase_prewarm(), 60),
             SleepPhase("replay",    lambda b: b._sleep_phase_replay(), 70),
+            # LTM hygiene: decay/prune/supersede.  Reads the consolidating
+            # cycle's recall journal (captured in _enter_asleep), so order
+            # relative to replay's rotation does not matter.
+            SleepPhase("memory_maintenance",
+                       lambda b: b._sleep_phase_memory_maintenance(), 78),
             SleepPhase("cleanup",   lambda b: b._sleep_phase_cleanup(), 80),
         ]
+
+    def _sleep_phase_memory_maintenance(self) -> bool:
+        """Run the decay/prune/supersession pass over LTM (memory_maintenance).
+
+        The forgetting counterpart to dreaming's accretion — see
+        memory_maintenance.MemoryMaintenance.  Best-effort and shadow-first
+        (both destructive layers are gated)."""
+        try:
+            from memory_maintenance import MemoryMaintenance
+            return MemoryMaintenance(self).run_sleep_pass()
+        except Exception as exc:
+            log.warning("Memory maintenance phase failed: %s", exc)
+            return True
 
     def _sleep_phases(self) -> List["SleepPhase"]:
         """Assemble the ordered sleep pipeline: brain core phases plus any a
@@ -2214,10 +2249,15 @@ class IyyeBrain:
     def _replay_journal_init(self) -> None:
         """Load this cycle's journal events and precompute fact↔activity pairing.
 
-        Pairing is plain adjacency: each ``stm_fact`` event is associated with
-        the nearest preceding ``stream_activity`` event (they were appended in
-        true temporal order), so no timestamp parsing or windowed scoring is
-        needed.
+        Pairing is by adjacency AND shared origin: each ``stm_fact`` event is
+        associated with the nearest preceding ``stream_activity`` event **only
+        when the fact's provenance names that activity's stream**
+        (``_provenance_names_stream``).  Adjacency alone is unsafe — a fact from
+        an unrelated stream that merely happened to be written near another
+        stream's activity would otherwise be fed into that activity's fact
+        extraction as "context", where the LLM could fold it into a durable but
+        unsupported conclusion (e.g. an unrelated "Alex prefers Rust" colouring
+        a planning step).  The same-origin requirement removes that channel.
 
         Replay is made **idempotent** so a mid-replay process restart cannot
         re-promote facts or repeat extraction: progress is reconstructed from
@@ -2248,8 +2288,12 @@ class IyyeBrain:
                 last_act = i
             elif etype == 'stm_fact' and last_act is not None:
                 fid = e.get('fact_id')
-                if fid:
-                    self._jreplay_fact_activity[fid] = self._jreplay_events[last_act]
+                act = self._jreplay_events[last_act]
+                # Only pair when the fact shares the activity's stream — plain
+                # temporal adjacency across streams would contaminate extraction.
+                if fid and _provenance_names_stream(
+                        e.get('provenance', ''), act.get('stream', '')):
+                    self._jreplay_fact_activity[fid] = act
                     self._jreplay_activity_facts.setdefault(last_act, []).append(
                         e.get('text', '')
                     )
@@ -2453,13 +2497,13 @@ class IyyeBrain:
                         'text': e.get('text', ''),
                         'confidence': e.get('confidence', 0.7),
                         'provenance': e.get('provenance', ''),
-                        'time_frame': e.get('time_frame', 'permanent'),
+                        'time_frame': e.get('time_frame', 'recent'),
                     }
-                    paired = self._jreplay_fact_activity.get(fid)
-                    entry = (
-                        {'stream': paired.get('stream'), 'timestamp': paired.get('ts')}
-                        if paired else None
-                    )
+                    # Use the fact's OWN event timestamp for promotion
+                    # provenance — not a paired activity's — so the recorded
+                    # time is the fact's real write time and is present even
+                    # for facts that share no activity's stream.
+                    entry = {'timestamp': e.get('ts')}
                     result = self._promote_stm_to_ltm(fact, entry)
                     if result is None:
                         # Transient LTM failure — keep the STM fact (do NOT add
@@ -2533,7 +2577,7 @@ class IyyeBrain:
                                 f"Extracted during sleep replay from "
                                 f"'{stream_name}' at {e.get('ts')}"
                             ),
-                            time_frame=kf.get('time_frame', 'permanent'),
+                            time_frame=kf.get('time_frame', 'recent'),
                         )
                         self._jreplay_discovered.append(
                             {'id': sid, 'text': kf_text})
@@ -2617,12 +2661,23 @@ class IyyeBrain:
                     or any(kw in prov_lower for kw in _REPLAY_SKIP_KEYWORDS)):
                 return self._PROMOTE_FILTERED
         try:
+            # Attribute to the STM fact's OWN provenance — the authoritative
+            # source recorded when the fact was written — not the nearest
+            # activity-log stream from replay pairing.  That pairing was a
+            # by-adjacency heuristic that frequently picked a high-frequency
+            # housekeeping stream (e.g. adenosine_stream, which ticks
+            # constantly) that merely logged near the write, misattributing the
+            # fact's origin (a fact about the user's name showed up as coming
+            # from 'adenosine_stream').  The timestamp is the fact's own write
+            # time (entry carries e['ts']); only the misleading stream name is
+            # dropped in favour of the real source.
+            src = (stm_fact.get('provenance') or '').strip()
+            ts = entry.get('timestamp') if entry else None
             provenance = "Promoted from STM during sleep replay"
-            if entry:
-                provenance += (
-                    f" (stream '{entry.get('stream')}'"
-                    f" at {entry.get('timestamp')})"
-                )
+            if src:
+                provenance += f" (source: {src}" + (f", at {ts})" if ts else ")")
+            elif ts:
+                provenance += f" (at {ts})"
             # LTM's pyarrow schema stores a single media_path; if the STM
             # fact accumulated multiple archives via dedup merges, pass the
             # first and log so the loss is visible.  Follow-up: extend LTM
@@ -2640,7 +2695,7 @@ class IyyeBrain:
                 confidence=float(stm_fact.get('confidence', 0.7)),
                 source=stm_fact.get('provenance', 'agent'),
                 provenance=provenance,
-                time_frame=stm_fact.get('time_frame', 'permanent'),
+                time_frame=stm_fact.get('time_frame', 'recent'),
                 media_path=paths[0] if paths else None,
             )
             # Credit a graduated generated stream when its fact reaches LTM —
@@ -2759,7 +2814,14 @@ class IyyeBrain:
             line = line.strip().strip('`')
             if not line:
                 continue
-            text, confidence, time_frame = line, 0.7, 'permanent'
+            # Durability is EARNED, not the default: an extraction that fails
+            # to tag time_frame (plain-text fallback, or JSON with a missing/
+            # invalid field) defaults to 'recent', which age-decays — so an
+            # untagged fact fades unless it recurs (dedup upgrades time_frame)
+            # or the model explicitly marks it durable.  Defaulting to
+            # 'permanent' was minting un-decayable, un-prunable facts that
+            # bypassed the entire memory-maintenance pass.
+            text, confidence, time_frame = line, 0.7, 'recent'
             if line.startswith('{'):
                 try:
                     obj = json.loads(line)

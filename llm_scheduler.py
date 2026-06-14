@@ -236,9 +236,20 @@ class LLMScheduler:
         from event_journal import emit, fingerprint
         call = job.call
         prompt_desc = call.prompt_name or f"inline:{fingerprint(call.user_prompt or '')}"
+        # Record which prompt *version* served this job (default "base") so the
+        # sleep self-improvement pass can attribute the outcome to the version
+        # that produced it — the per-version reward signal for #6 prompt tuning.
+        prompt_version = "base"
+        if call.prompt_name:
+            try:
+                from llm_client import active_prompt_version
+                prompt_version = active_prompt_version(call.prompt_name)
+            except Exception:
+                pass
         emit(self._journal(), "llm_submit",
              job_id=job.job_id, stream=job.stream_name, kind=job.kind,
-             role=job.role, conscious=job.conscious, prompt=prompt_desc)
+             role=job.role, conscious=job.conscious, prompt=prompt_desc,
+             prompt_name=call.prompt_name or None, prompt_version=prompt_version)
 
     def poll(self, stream_name: str) -> Optional[LLMResult]:
         """Return (and clear) a completed result for *stream_name*, or None.
