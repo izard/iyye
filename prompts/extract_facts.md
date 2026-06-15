@@ -4,9 +4,10 @@ variables:
   stream_name: Name of the conscious stream
   stream_output: Raw output text from the stream's activity log
   paired_facts: >
-    Short-term memory facts that were written around the same time as this
-    log entry (within ~60s, same stream preferred).  Treat them as context
-    that may clarify what the stream was actually doing.  May be "(none)".
+    Short-term memory facts written by THIS SAME stream within ~60s of this
+    log entry (enforced — cross-stream and stale facts are excluded).  Treat
+    them as context that may clarify what the stream was actually doing.  May
+    be "(none)".
 ---
 
 You are a memory consolidation module. Your job is to extract concise, reusable facts from a stream of conscious activity.
