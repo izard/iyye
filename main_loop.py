@@ -1912,6 +1912,12 @@ class IyyeBrain:
     # decisions; the *work* of each phase is owned by a stream/producer.
     _SLEEP_WAKEUP_GATE_ORDER = 50
     _REPLAY_BATCH = 3  # LLM extraction calls per replay tick
+    # Max seconds between an activity and an STM fact for them to be paired as
+    # extraction context.  Same-stream writes happen in one execute tick (the
+    # recorded gaps are ~0s), so this only rejects the pathological case: a
+    # stream whose last activity was long ago writing a fact now with no
+    # intervening activity — stale context the ~60s the prompt promises excludes.
+    _PAIR_MAX_GAP_S = 60
     # Event types sleep replay reads (everything else — sensor_input, stm_merge
     # — is high-volume noise replay ignores; filtering them keeps the replay
     # working set bounded, issue #9):
@@ -2293,10 +2299,14 @@ class IyyeBrain:
             elif etype == 'stm_fact' and last_act is not None:
                 fid = e.get('fact_id')
                 act = self._jreplay_events[last_act]
-                # Only pair when the fact shares the activity's stream — plain
-                # temporal adjacency across streams would contaminate extraction.
-                if fid and _provenance_names_stream(
-                        e.get('provenance', ''), act.get('stream', '')):
+                # Pair only when the fact (a) shares the activity's stream and
+                # (b) was written within _PAIR_MAX_GAP_S of it.  (a) blocks
+                # cross-stream contamination; (b) blocks stale same-stream
+                # context — a stream whose last activity was long ago writing a
+                # fact now with no activity in between.
+                if (fid and _provenance_names_stream(
+                        e.get('provenance', ''), act.get('stream', ''))
+                        and self._events_within_gap(act, e)):
                     self._jreplay_fact_activity[fid] = act
                     self._jreplay_activity_facts.setdefault(last_act, []).append(
                         e.get('text', '')
@@ -2348,6 +2358,28 @@ class IyyeBrain:
         # revisited — the durable retry queue is the only thing that survives
         # both (issue: failed promotion retained but never retried).
         self._retry_failed_promotions()
+
+    @classmethod
+    def _events_within_gap(cls, a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        """True when journal events *a* and *b* are within ``_PAIR_MAX_GAP_S``.
+
+        Both events carry an ISO-8601 ``ts``.  If either is missing or
+        unparseable the pair is rejected (conservative: better to drop a pairing
+        than feed possibly-stale context — consistent with the same-origin gate)."""
+        ta, tb = cls._event_ts(a), cls._event_ts(b)
+        if ta is None or tb is None:
+            return False
+        return abs((tb - ta).total_seconds()) <= cls._PAIR_MAX_GAP_S
+
+    @staticmethod
+    def _event_ts(e: Dict[str, Any]) -> Optional["datetime"]:
+        ts = e.get('ts')
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            return None
 
     # ------------------------------------------------------------------ #
     # Durable promotion retry queue (survives cycle rotation + STM pruning)
