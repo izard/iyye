@@ -23,6 +23,7 @@ Rules:
 - Do NOT reason about the task, do NOT explain your process, do NOT output analysis steps
 - Skip observations that are transient or not worth remembering
 - Skip procedural steps — keep only conclusions and discoveries
+- NEVER record the system's own bookkeeping events — that a profile/contact/record/stream/memory/plan was created, updated, stored, promoted, processed, or generated. The resulting STATE is the fact (e.g. the profile's content, the contact's identity), never the act of recording it. Bad: "Alex's profile was updated", "New contact: Jacob". Good: the actual content of the profile, or "Jacob is Alex's contact on Telegram".
 - Use present tense for ongoing states, past tense for completed events
 - If there are no facts worth storing, output exactly nothing (empty response)
 - NEVER extract system metric snapshots — CPU%, memory%, adenosine level, disk%, tick numbers, and stream counts are ephemeral and worthless in long-term memory
