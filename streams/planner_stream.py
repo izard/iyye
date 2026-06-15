@@ -666,7 +666,13 @@ class PlannerStream(LLMConsumerMixin, ProcessingStream):
         reused by both the assessment and the revision."""
         try:
             from recall import Recall
-            return Recall(self.brain).query(plan.goal, limit=6)
+            rc = Recall(self.brain)
+            results = rc.query(plan.goal, limit=6)
+            # These facts inform the plan assessment/revision below, so mark
+            # them used — otherwise the recall event logs retrieved-but-unused
+            # and the usefulness signal would wrongly decay plan-relevant facts.
+            rc.mark_used(results)
+            return results
         except Exception as exc:
             log.debug("Replan: recall failed for %s: %s", plan.plan_id, exc)
             return []

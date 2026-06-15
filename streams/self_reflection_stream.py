@@ -570,8 +570,11 @@ class SelfReflectionStream(LLMConsumerMixin, ProcessingStream):
     # and let the registry promote/roll back a trialled prompt rewrite.  The
     # fold + select are side-effect-light (no-ops until a trial exists);
     # proposing a new candidate (which changes what serves traffic) is gated
-    # behind _PROMPT_TRIAL_APPLY — shadow-first, like attention tuning.
-    _PROMPT_TRIAL_APPLY = False
+    # behind _PROMPT_TRIAL_APPLY.  Enabled after the shadow fold established
+    # baselines: alignment_batch_streams succeeds only ~0.556 over 72 samples —
+    # a well-sampled rewrite target — and trials are bounded by validate_candidate
+    # plus select()'s margin-or-rollback, so a worse rewrite is auto-reverted.
+    _PROMPT_TRIAL_APPLY = True
 
     def sleep_phases(self) -> List[SleepPhase]:
         # Order 65: before replay (70) consolidates/clears STM, so the day's

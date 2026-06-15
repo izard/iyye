@@ -212,9 +212,10 @@ class AttentionStream(ProcessingStream):
     _TARGET_REWARD_RATE = 0.1
     _TUNE_LR = 0.02            # gradient step toward predicting reward
     _TUNE_REG = 0.01           # pull-back toward defaults (anti-drift)
-    # Phase A: shadow only — journal the proposed weights, do not apply.  Flip
-    # to True (Phase B) after validating the proposals over recorded cycles.
-    _TUNE_APPLY = False
+    # Phase B: enabled after validation — 9 recorded cycles produced tiny,
+    # regularized, bounded weight deltas with net drift ≈ 0 (no divergence).
+    # Reversible: delete attention_weights.json to restore _DEFAULT_WEIGHTS.
+    _TUNE_APPLY = True
 
     def sleep_phases(self) -> List[SleepPhase]:
         # Order 76: after plan review (75), before cleanup (80).
