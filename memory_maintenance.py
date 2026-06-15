@@ -272,10 +272,18 @@ class MemoryMaintenance:
     # (high overlap but not identical — identical is dedup's job, not ours).
     _PAIR_OVERLAP = 0.5
 
-    # Gates — shadow until validated on recorded cycles, like _TUNE_APPLY.
-    _DECAY_APPLY = False       # write decayed confidence back to the store
-    _PRUNE_APPLY = False       # delete prune candidates
-    _SUPERSEDE_APPLY = False   # retire the loser of a contradiction
+    # Gates — flipped on once recorded cycles validated the behaviour.
+    # Decay: enabled — 70 decays over 8 sleeps were all gentle (none below
+    # 0.30, floor stays 0.2), reversible (confidence recovers on re-observation).
+    _DECAY_APPLY = True        # write decayed confidence back to the store
+    # Prune: enabled — 0 candidates over 8 sleeps (inert today); the selection
+    # rule (non-durable AND aged past 2× its window AND never used AND below
+    # floor) is conservative and will only fire on genuinely dead facts.
+    _PRUNE_APPLY = True        # delete prune candidates
+    # Supersede: enabled — under the fixed contradiction prompt only `same`
+    # consolidations were emitted (0 false `contradict`), and the deterministic
+    # winner keeps the more durable copy, so information is retained.
+    _SUPERSEDE_APPLY = True    # retire the loser of a contradiction/duplicate
 
     def __init__(self, brain: Any):
         self.brain = brain

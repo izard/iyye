@@ -44,15 +44,47 @@ log = logging.getLogger("Iyye.Capabilities")
 
 
 class ReadOnlyMemory:
-    """Long-term-memory façade granting search/count but never writes."""
+    """Long-term-memory façade granting search/count but never writes.
 
-    __slots__ = ("_mem",)
+    Searches route through unified :class:`recall.Recall` when a *brain* is
+    supplied, so a query a generated stream (or the privileged chat
+    interpreter) issues is journaled (``recall``/``recall_used``) and feeds the
+    retrieval-quality signal that memory decay/pruning consume — the same loop
+    chat already drives.  Without a brain it falls back to the raw store, so the
+    façade still works in isolation/tests."""
 
-    def __init__(self, memory: Any) -> None:
+    __slots__ = ("_mem", "_brain")
+
+    def __init__(self, memory: Any, brain: Any = None) -> None:
         self._mem = memory
+        self._brain = brain
 
-    def search(self, *a, **kw):
-        return self._mem.search(*a, **kw)
+    def search(self, query: str, limit: int = 10, **kw):
+        if self._brain is not None:
+            try:
+                from recall import Recall
+                rc = Recall(self._brain)
+                results = rc.query(query, limit=limit)
+                # An explicit tool search is an intentional retrieval the caller
+                # acts on — mark the hits used so they aren't mistaken for
+                # retrieved-but-dead weight (which would wrongly decay them).
+                rc.mark_used(results)
+                return [self._as_fact(r) for r in results]
+            except Exception as exc:
+                log.debug("ReadOnlyMemory: recall path failed (%s) — raw store", exc)
+        return self._mem.search(query, limit=limit, **kw)
+
+    @staticmethod
+    def _as_fact(r: Any) -> Dict[str, Any]:
+        """Render a RecallResult back into the fact-dict shape callers expect."""
+        return {
+            "id":         getattr(r, "ref", None),
+            "text":       getattr(r, "text", ""),
+            "confidence": getattr(r, "confidence", None),
+            "time_frame": getattr(r, "time_frame", None),
+            "provenance": getattr(r, "provenance", ""),
+            "source":     getattr(r, "source", ""),  # store: ltm/stm/tom
+        }
 
     def count(self):
         try:

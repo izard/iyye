@@ -43,6 +43,7 @@ from memory_filters import (
     SKIP_STREAM_PREFIXES as _REPLAY_SKIP_PREFIXES,
     SKIP_STREAM_KEYWORDS as _REPLAY_SKIP_KEYWORDS,
     provenance_names_stream as _provenance_names_stream,
+    is_bookkeeping_fact as _is_bookkeeping_fact,
 )
 
 # LTM-specific noise filter — kept here because it is only used during
@@ -1181,7 +1182,10 @@ class IyyeBrain:
             stm = _GraduatedSTM(self.stm, f"gen_graduated:{stream.name}")
         else:
             stm = _SessionOnlySTM(self.stm, f"llm_gen:{stream.name}")
-        ro_mem = ReadOnlyMemory(self.memory)
+        # Pass the brain so memory searches route through unified Recall and
+        # feed the retrieval-quality signal (memory decay/pruning), not just the
+        # raw store — broadening the signal beyond chat (#2).
+        ro_mem = ReadOnlyMemory(self.memory, brain=self)
         emit_fn = self._emitter_for(stream) if graduated else None
         cap = Capabilities(
             stm=stm, memory=ro_mem, stream=stream,
@@ -2562,7 +2566,8 @@ class IyyeBrain:
                     for kf in key_facts:
                         kf_text = kf.get('text', '')
                         if (_EPHEMERAL_METRIC_RE.search(kf_text)
-                                or _LTM_NOISE_RE.search(kf_text)):
+                                or _LTM_NOISE_RE.search(kf_text)
+                                or _is_bookkeeping_fact(kf_text)):
                             continue
                         # Per-fact tags from extraction (HLD: LTM fact format
                         # is the same tagged format as STM).  Ephemeral facts
@@ -2648,7 +2653,8 @@ class IyyeBrain:
         if stm_fact.get('time_frame') in ('ephemeral', 'session'):
             return self._PROMOTE_FILTERED
         text = stm_fact.get('text', '')
-        if _EPHEMERAL_METRIC_RE.search(text) or _LTM_NOISE_RE.search(text):
+        if (_EPHEMERAL_METRIC_RE.search(text) or _LTM_NOISE_RE.search(text)
+                or _is_bookkeeping_fact(text)):
             return self._PROMOTE_FILTERED
         # Reject facts from LLM-generated / planned streams.  Their output
         # is internal recommendations or operational noise, never durable
@@ -2841,6 +2847,10 @@ class IyyeBrain:
             if _LTM_NOISE_RE.search(text):
                 continue
             if _EPHEMERAL_METRIC_RE.search(text):
+                continue
+            # Process/bookkeeping events (state-transitions on internal
+            # artifacts) are not durable world knowledge — see memory_filters.
+            if _is_bookkeeping_fact(text):
                 continue
             # Skip HTML / thinking tags
             if text.startswith('<') and '>' in text:
